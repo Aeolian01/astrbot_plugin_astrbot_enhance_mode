@@ -2780,13 +2780,11 @@ class Main(star.Star):
                     event.set_extra("_enhance_active_reply_triggered", True)
                     event.set_extra("_enhance_active_reply_mode", cfg.active_reply.mode)
 
-                active_prompt = str(
-                    self._get_extra_value(
-                        event, ENHANCE_ACTIVE_REPLY_PROMPT_KEY, ""
-                    )
-                    or self._get_forward_context_text(event)
-                    or event.message_str
-                    or ""
+                active_context = await self._collect_active_reply_context(event, cfg)
+                active_prompt = self._build_active_reply_prompt(
+                    cfg,
+                    active_context,
+                    cfg.active_reply.mode,
                 )
                 if hasattr(event, "set_extra"):
                     event.set_extra(ENHANCE_ACTIVE_REPLY_PROMPT_KEY, active_prompt)
@@ -2883,42 +2881,50 @@ class Main(star.Star):
         )
         is_active_triggered = False
         active_mode = ""
-        is_seeded_context = False
         if is_react_group:
             is_active_triggered = event.get_extra(
                 "_enhance_active_reply_triggered", False
             )
             active_mode = event.get_extra("_enhance_active_reply_mode", "")
-            is_seeded_context = self._is_truthy_extra(
-                self._get_extra_value(
-                    event,
-                    ENHANCE_ACTIVE_REPLY_SEEDED_CONTEXT_KEY,
-                    False,
-                )
+
+        if is_react_group and is_active_triggered:
+            active_prompt = str(
+                self._get_extra_value(event, ENHANCE_ACTIVE_REPLY_PROMPT_KEY, "")
+                or req.prompt
+                or ""
             )
+            if active_prompt:
+                req.prompt = active_prompt
+                req.contexts = []
+                logger.info(
+                    "enhance-mode | active_reply prompt injected | origin=%s mode=%s prompt_len=%s",
+                    event.unified_msg_origin,
+                    active_mode or "unknown",
+                    len(active_prompt),
+                )
+            return
 
         bounded_chats = ""
-        if not (is_active_triggered and is_seeded_context):
-            context_lines = await self._get_group_context_lines(
-                event,
-                cfg,
-                exclude_current=False,
-            )
-            if not context_lines:
-                return
+        context_lines = await self._get_group_context_lines(
+            event,
+            cfg,
+            exclude_current=False,
+        )
+        if not context_lines:
+            return
 
-            self._touch_origin(event.unified_msg_origin, cfg)
-            context_lines = await self._resolve_image_captions_for_context_lines(
-                event,
-                cfg,
-                context_lines,
-            )
-            bounded_chats = bounded_chat_history_text(context_lines)
-            logger.debug(
-                "enhance-mode | injecting group context | origin=%s history_size=%s",
-                event.unified_msg_origin,
-                len(context_lines),
-            )
+        self._touch_origin(event.unified_msg_origin, cfg)
+        context_lines = await self._resolve_image_captions_for_context_lines(
+            event,
+            cfg,
+            context_lines,
+        )
+        bounded_chats = bounded_chat_history_text(context_lines)
+        logger.debug(
+            "enhance-mode | injecting group context | origin=%s history_size=%s",
+            event.unified_msg_origin,
+            len(context_lines),
+        )
         interaction_instructions = build_interaction_instructions(
             cfg.group_features.mention_parse,
             cfg.group_history.include_sender_id,
@@ -2938,16 +2944,10 @@ class Main(star.Star):
             )
 
         if is_react_group:
-            if is_active_triggered and is_seeded_context:
-                history_prefix = (
-                    "You are now in a chatroom. Recent group chat history has "
-                    "already been attached to the conversation context.\n\n"
-                )
-            else:
-                history_prefix = (
-                    "You are now in a chatroom. The chat history is as follows:\n"
-                    f"{bounded_chats}\n\n"
-                )
+            history_prefix = (
+                "You are now in a chatroom. The chat history is as follows:\n"
+                f"{bounded_chats}\n\n"
+            )
             if is_active_triggered and active_mode == "model_choice":
                 req.prompt = (
                     f"{history_prefix}"
@@ -2969,8 +2969,7 @@ class Main(star.Star):
                     "You MUST use the SAME language as the chatroom is using."
                     f"{interaction_instructions}"
                 )
-            if not (is_active_triggered and is_seeded_context):
-                req.contexts = []
+            req.contexts = []
         else:
             req.system_prompt += (
                 "You are now in a chatroom. The chat history is as follows: \n"
