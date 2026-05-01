@@ -96,7 +96,7 @@ class ActiveReplyConfig:
     mode: str = "probability"
     possibility: float = 0.1
     auto_create_conversation: bool = True
-    seed_context_on_auto_create: bool = True
+    seed_context_on_auto_create: bool = False
     min_seed_context_messages: int = 6
     model_choice_max_context_messages: int = 6
     model_stack_size: int = 8
@@ -230,7 +230,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             active_reply_raw.get("auto_create_conversation"), True
         ),
         seed_context_on_auto_create=_to_bool(
-            active_reply_raw.get("seed_context_on_auto_create"), True
+            active_reply_raw.get("seed_context_on_auto_create"), False
         ),
         min_seed_context_messages=max(
             0, _to_int(active_reply_raw.get("min_seed_context_messages"), 6)
