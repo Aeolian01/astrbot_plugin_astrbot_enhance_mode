@@ -3,14 +3,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 DEFAULT_MODEL_CHOICE_PROMPT = (
-    "你当前的人格面具是：{persona_name}\n"
-    "人格设定如下：\n{persona_mask}\n\n"
-    "你正在群聊中扮演助手。以下是最近 {stack_size} 条群聊消息：\n"
+    "你是一个二分类判定器，不是聊天机器人。\n"
+    "你的唯一任务是判断当前人格是否应该在群聊中主动回复。\n\n"
+    "当前人格面具：{persona_name}\n"
+    "人格设定：\n{persona_mask}\n\n"
+    "输出规则必须严格遵守：\n"
+    "- 如果应该主动回复，只输出：REPLY\n"
+    "- 如果不应该主动回复，只输出：SKIP\n"
+    "- 禁止输出解释、推理过程、标点、表情、中文或其它任何内容\n"
+    "- 禁止直接生成群聊回复内容\n\n"
+    "最近 {stack_size} 条群聊消息：\n"
     "{messages}\n\n"
     "额外历史上下文（最近 {history_count} 条）：\n"
     "{history_context}\n\n"
-    "请严格站在该人格的角度判断你是否应该主动回复。"
-    "如果需要回复，只输出 REPLY；如果不需要回复，只输出 SKIP。"
+    "最终答案只能是 REPLY 或 SKIP："
 )
 DEFAULT_WEB_SEARCH_SYSTEM_PROMPT = (
     "You are a web research assistant. Use live web search/browsing when answering. "
@@ -89,6 +95,10 @@ class ActiveReplyConfig:
     enable: bool = False
     mode: str = "probability"
     possibility: float = 0.1
+    auto_create_conversation: bool = True
+    seed_context_on_auto_create: bool = True
+    min_seed_context_messages: int = 6
+    model_choice_max_context_messages: int = 6
     model_stack_size: int = 8
     model_history_messages: int = 0
     model_choice_provider_id: str = ""
@@ -101,6 +111,7 @@ class GroupFeatureEnhancementConfig:
     react_mode_enable: bool = False
     role_display: bool = True
     mention_parse: bool = True
+    refuse_enable: bool = True
     ban_control_enable: bool = True
     ban_max_duration_sec: int = 2592000
     ban_allow_admin: bool = False
@@ -183,6 +194,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         react_mode_enable=_to_bool(group_features_raw.get("react_mode_enable"), False),
         role_display=_to_bool(group_features_raw.get("role_display"), True),
         mention_parse=_to_bool(group_features_raw.get("mention_parse"), True),
+        refuse_enable=_to_bool(group_features_raw.get("refuse_enable"), True),
         ban_control_enable=_to_bool(group_features_raw.get("ban_control_enable"), True),
         ban_max_duration_sec=max(
             1, _to_int(group_features_raw.get("ban_max_duration_sec"), 2592000)
@@ -214,6 +226,18 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         enable=_to_bool(active_reply_raw.get("enable"), False),
         mode=mode,
         possibility=_to_probability(active_reply_raw.get("possibility"), 0.1),
+        auto_create_conversation=_to_bool(
+            active_reply_raw.get("auto_create_conversation"), True
+        ),
+        seed_context_on_auto_create=_to_bool(
+            active_reply_raw.get("seed_context_on_auto_create"), True
+        ),
+        min_seed_context_messages=max(
+            0, _to_int(active_reply_raw.get("min_seed_context_messages"), 6)
+        ),
+        model_choice_max_context_messages=max(
+            0, _to_int(active_reply_raw.get("model_choice_max_context_messages"), 6)
+        ),
         model_stack_size=max(1, _to_int(active_reply_raw.get("model_stack_size"), 8)),
         model_history_messages=max(
             0, _to_int(active_reply_raw.get("model_history_messages"), 0)

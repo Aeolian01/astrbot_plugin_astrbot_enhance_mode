@@ -30,7 +30,7 @@
             },
             "image_caption": {
                 "description": "图片转述",
-                "hint": "启用按需图片转述能力。历史默认写入 [Image]，模型可通过工具按需补全描述。",
+                "hint": "启用图片转述能力。历史先写入 [Image]，在注入群聊上下文时自动解析为图片描述；模型仍可通过工具按需补全。",
                 "type": "bool",
                 "default": false
             },
@@ -72,6 +72,30 @@
                 "type": "float",
                 "default": 0.1
             },
+            "auto_create_conversation": {
+                "description": "自动创建会话",
+                "hint": "主动回复触发但当前群未处于 AstrBot 对话状态时，自动创建并切换到新会话。关闭后会恢复为要求先使用 /switch 或 /new。",
+                "type": "bool",
+                "default": true
+            },
+            "seed_context_on_auto_create": {
+                "description": "新会话附带群聊上下文",
+                "hint": "自动创建会话时，将最近群聊上下文写入新会话初始历史。本轮请求会避免重复 prompt 注入。依赖群聊历史增强开启。",
+                "type": "bool",
+                "default": true
+            },
+            "min_seed_context_messages": {
+                "description": "上下文补齐阈值",
+                "hint": "注入群聊上下文前，如果缓存可用历史少于该条数，会尝试通过平台适配器查询 QQ 群最新历史补齐，并最多补齐该条数；设为 0 可关闭补齐查询。",
+                "type": "int",
+                "default": 6
+            },
+            "model_choice_max_context_messages": {
+                "description": "模型判定最多上下文",
+                "hint": "当 mode=model_choice 时生效，判定 prompt 最多注入最近多少条群聊上下文。设为 0 表示不注入群聊上下文。",
+                "type": "int",
+                "default": 6
+            },
             "model_stack_size": {
                 "description": "模型触发栈长度",
                 "hint": "当 mode=model_choice 时生效，累计到该条数后触发一次模型判定。",
@@ -93,9 +117,9 @@
             },
             "model_choice_prompt": {
                 "description": "模型判定提示词",
-                "hint": "可使用 {stack_size}、{messages}、{history_count}、{history_context}、{persona_name}、{persona_mask} 占位符，模型需只输出 REPLY 或 SKIP。",
+                "hint": "可使用 {stack_size}、{messages}、{history_count}、{history_context}、{persona_name}、{persona_mask} 占位符；{history_count} 为实际注入的群聊上下文和额外判定历史总数，模型需只输出 REPLY 或 SKIP。",
                 "type": "string",
-                "default": "你当前的人格面具是：{persona_name}\n人格设定如下：\n{persona_mask}\n\n你正在群聊中扮演助手。以下是最近 {stack_size} 条群聊消息：\n{messages}\n\n额外历史上下文（最近 {history_count} 条）：\n{history_context}\n\n请严格站在该人格的角度判断你是否应该主动回复。如果需要回复，只输出 REPLY；如果不需要回复，只输出 SKIP。"
+                "default": "你是一个二分类判定器，不是聊天机器人。\n你的唯一任务是判断当前人格是否应该在群聊中主动回复。\n\n当前人格面具：{persona_name}\n人格设定：\n{persona_mask}\n\n输出规则必须严格遵守：\n- 如果应该主动回复，只输出：REPLY\n- 如果不应该主动回复，只输出：SKIP\n- 禁止输出解释、推理过程、标点、表情、中文或其它任何内容\n- 禁止直接生成群聊回复内容\n\n最近 {stack_size} 条群聊消息：\n{messages}\n\n额外历史上下文（最近 {history_count} 条）：\n{history_context}\n\n最终答案只能是 REPLY 或 SKIP："
             },
             "whitelist": {
                 "description": "白名单",
@@ -107,7 +131,7 @@
     },
     "group_features": {
         "description": "群聊功能增强",
-        "hint": "与群聊交互行为相关的增强能力（React 模式、角色注入、Mention/Quote 标签解析）。",
+        "hint": "与群聊交互行为相关的增强能力（React 模式、角色注入、Mention/Quote/Refuse 标签解析）。",
         "type": "object",
         "items": {
             "react_mode_enable": {
@@ -125,6 +149,12 @@
             "mention_parse": {
                 "description": "Mention/Quote 标签解析",
                 "hint": "解析 LLM 输出中的 <mention id=\"用户ID\"/> 与 <quote id=\"消息ID\"/>，并转换为平台消息组件。",
+                "type": "bool",
+                "default": true
+            },
+            "refuse_enable": {
+                "description": "是否启用 Refuse",
+                "hint": "启用后向模型注入 <refuse/> 使用说明，并在模型完整输出 <refuse/> 时取消发送本轮回复。",
                 "type": "bool",
                 "default": true
             },

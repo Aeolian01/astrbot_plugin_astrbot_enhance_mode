@@ -89,6 +89,7 @@ def clean_response_text_for_history(completion_text: str) -> str:
 def build_interaction_instructions(
     mention_parse: bool,
     include_sender_id: bool,
+    refuse_enable: bool = True,
 ) -> str:
     instructions = ""
     if mention_parse and include_sender_id:
@@ -112,12 +113,13 @@ def build_interaction_instructions(
         "Only use quote when it is meaningful to reference a specific message.\n"
         "Important: quote tag is NOT a container tag. Do NOT output </quote>."
     )
-    instructions += (
-        "\n\n## Refuse\n"
-        "If you decide not to reply, output exactly `<refuse/>` as the entire response.\n"
-        "The first characters MUST be `<refuse/>`, with no extra text before or after.\n"
-        "Any other format will be treated as normal text and sent through."
-    )
+    if refuse_enable:
+        instructions += (
+            "\n\n## Refuse\n"
+            "If you decide not to reply, output exactly `<refuse/>` as the entire response.\n"
+            "The first characters MUST be `<refuse/>`, with no extra text before or after.\n"
+            "Any other format will be treated as normal text and sent through."
+        )
     return instructions
 
 
