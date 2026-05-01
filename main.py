@@ -1405,16 +1405,25 @@ class Main(star.Star):
             return []
 
         raw_payload = self._raw_event_value(event, "raw")
-        current_seq = (
-            self._raw_event_value(event, "message_seq")
-            or self._raw_event_value(event, "real_seq")
-            or self._raw_event_value(event, "msgSeq")
-            or (
-                raw_payload.get("msgSeq")
-                if isinstance(raw_payload, dict)
-                else None
-            )
+        current_seq_candidates = (
+            ("real_seq", self._raw_event_value(event, "real_seq")),
+            (
+                "raw.msgSeq",
+                raw_payload.get("msgSeq") if isinstance(raw_payload, dict) else None,
+            ),
+            ("msgSeq", self._raw_event_value(event, "msgSeq")),
+            ("message_seq", self._raw_event_value(event, "message_seq")),
         )
+        current_seq_source = ""
+        current_seq = None
+        for source, value in current_seq_candidates:
+            clean_value = str(value or "").strip()
+            if not clean_value:
+                continue
+            current_seq_source = source
+            current_seq = clean_value
+            break
+
         group_value = self._numeric_if_digits(group_id)
         candidates: list[dict[str, Any]] = []
         if current_seq:
@@ -1435,6 +1444,7 @@ class Main(star.Star):
             )
         candidates.append({"group_id": group_value})
 
+        best_messages: list[Any] = []
         for params in candidates:
             result = await self._call_onebot_action(
                 event,
@@ -1443,14 +1453,18 @@ class Main(star.Star):
             )
             messages = self._extract_adapter_history_messages(self._onebot_data(result))
             if messages:
+                if len(messages) > len(best_messages):
+                    best_messages = messages
                 logger.debug(
-                    "enhance-mode | adapter history fetched | origin=%s count=%s params=%s",
+                    "enhance-mode | adapter history fetched | origin=%s count=%s seq_source=%s params=%s",
                     event.unified_msg_origin,
                     len(messages),
+                    current_seq_source or "none",
                     params,
                 )
-                return messages
-        return []
+                if len(messages) >= min(limit, 2):
+                    return messages
+        return best_messages
 
     async def _backfill_group_history(
         self,
