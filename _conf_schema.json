@@ -78,12 +78,6 @@
                 "type": "bool",
                 "default": true
             },
-            "min_seed_context_messages": {
-                "description": "上下文补齐阈值",
-                "hint": "如果缓存可用历史较少，会尝试通过平台适配器查询 QQ 群最新历史补齐。设为 0 可关闭补齐查询。",
-                "type": "int",
-                "default": 6
-            },
             "model_choice_max_context_messages": {
                 "description": "模型判定最多上下文",
                 "hint": "当 mode=model_choice 时生效，判定 prompt 最多注入最近多少条群聊上下文。设为 0 表示不注入群聊上下文。",
