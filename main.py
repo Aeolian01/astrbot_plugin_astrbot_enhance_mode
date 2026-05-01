@@ -1370,97 +1370,6 @@ class Main(star.Star):
             != normalized_current
         ]
 
-    async def _query_adapter_group_history_lines(
-        self, event: AstrMessageEvent, cfg: PluginConfig, current_msg_id: str
-    ) -> list[str]:
-        max_messages = max(1, cfg.group_history.max_messages)
-        backfill_limit = max(1, min(max_messages, cfg.active_reply.min_seed_context_messages))
-        bot = getattr(event, "bot", None)
-        call_action = getattr(bot, "call_action", None)
-        group_id = event.get_group_id()
-        if callable(call_action) and group_id:
-            group_value = int(group_id) if str(group_id).isdigit() else group_id
-            message_seq = (
-                self._raw_event_value(event, "message_seq")
-                or self._raw_event_value(event, "real_seq")
-            )
-            attempts: list[dict[str, Any]] = [{"group_id": group_value}]
-            if message_seq:
-                attempts.append({"group_id": group_value, "message_seq": message_seq})
-
-            for params in attempts:
-                try:
-                    response = await call_action("get_group_msg_history", **params)
-                except Exception as e:
-                    logger.debug(
-                        "enhance-mode | 平台适配器不支持或无法查询群聊历史 | "
-                        "origin=%s params=%s error=%s",
-                        event.unified_msg_origin,
-                        params,
-                        e,
-                    )
-                    continue
-
-                messages = []
-                if isinstance(response, dict):
-                    messages = response.get("messages") or response.get("data") or []
-                elif isinstance(response, list):
-                    messages = response
-                if not isinstance(messages, list):
-                    continue
-
-                messages = sorted(messages, key=self._history_message_sort_key)
-
-                entries = []
-                for message in messages:
-                    entry = await self._format_adapter_history_entry(event, message)
-                    if entry.get("line"):
-                        entries.append(entry)
-                if current_msg_id:
-                    normalized_current = self._normalize_message_id(current_msg_id)
-                    entries = [
-                        entry
-                        for entry in entries
-                        if self._normalize_message_id(entry.get("message_id", ""))
-                        != normalized_current
-                    ]
-                if entries:
-                    entries = entries[-backfill_limit:]
-                    lines = [str(entry.get("line") or "") for entry in entries]
-                    for entry in entries:
-                        self._register_history_image_sources(
-                            event.unified_msg_origin,
-                            str(entry.get("message_id") or ""),
-                            [
-                                str(image_url or "")
-                                for image_url in entry.get("image_urls", [])
-                            ],
-                            [
-                                str(cache_source or "")
-                                for cache_source in entry.get("cache_sources", [])
-                            ],
-                        )
-                    logger.info(
-                        "enhance-mode | 已从平台适配器补充群聊上下文 | "
-                        "origin=%s params=%s count=%s",
-                        event.unified_msg_origin,
-                        params,
-                        len(lines),
-                    )
-                    return lines
-
-        return []
-
-    async def _query_recent_group_history_lines(
-        self, event: AstrMessageEvent, cfg: PluginConfig, current_msg_id: str
-    ) -> list[str]:
-        adapter_lines = await self._query_adapter_group_history_lines(
-            event,
-            cfg,
-            current_msg_id,
-        )
-        return adapter_lines
-
     async def _get_group_context_lines(
         self, event: AstrMessageEvent, cfg: PluginConfig, exclude_current: bool
     ) -> list[str]:
@@ -1475,31 +1384,7 @@ class Main(star.Star):
             prior_lines = cached_lines[:-1] if cached_lines else []
         else:
             prior_lines = [line for line in cached_lines if line]
-        min_context_messages = max(0, cfg.active_reply.min_seed_context_messages)
-        if min_context_messages <= 0 or len(prior_lines) >= min_context_messages:
-            return prior_lines[-cfg.group_history.max_messages :]
-
-        queried_lines = await self._query_recent_group_history_lines(
-            event,
-            cfg,
-            current_msg_id,
-        )
-        if not queried_lines:
-            return prior_lines[-cfg.group_history.max_messages :]
-
-        self._touch_origin(origin, cfg)
-        merged = queried_lines + [
-            line for line in cached_lines if line and line not in queried_lines
-        ]
-        self.runtime.session_chats[origin] = merged[-cfg.group_history.max_messages :]
-
-        if exclude_current and current_msg_id:
-            merged_context = self._remove_current_history_line(merged, current_msg_id)
-        else:
-            merged_context = [line for line in merged if line]
-        if exclude_current and not current_msg_id and merged_context:
-            merged_context = merged_context[:-1]
-        return merged_context[-cfg.group_history.max_messages :]
+        return prior_lines[-cfg.group_history.max_messages :]
 
     async def _resolve_active_current_message_text(
         self, event: AstrMessageEvent, cfg: PluginConfig
