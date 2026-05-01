@@ -298,6 +298,10 @@ class Main(star.Star):
         return f"{cls_name}({model})" if model else cls_name
 
     @staticmethod
+    def _history_recording_enabled(cfg: PluginConfig) -> bool:
+        return cfg.group_history_enabled or cfg.active_reply_enabled
+
+    @staticmethod
     def _normalize_message_id(raw: str | int | None) -> str:
         text = str(raw or "").strip()
         if text.startswith("#msg"):
@@ -312,6 +316,11 @@ class Main(star.Star):
         if not matched:
             return ""
         return str(matched.group(1) or "").strip()
+
+    @staticmethod
+    def _numeric_if_digits(value: str) -> str | int:
+        text = str(value or "").strip()
+        return int(text) if text.isdigit() else text
 
     @staticmethod
     def _replace_image_marker_at_index(
@@ -1296,33 +1305,6 @@ class Main(star.Star):
             "cache_sources": [source["cache_source"] for source in image_sources],
         }
 
-    def _format_adapter_history_line(self, message: Any) -> str:
-        if not isinstance(message, dict):
-            return ""
-
-        raw_parts = message.get("message")
-        if raw_parts is None:
-            raw_parts = message.get("raw_message") or message.get("message_str") or ""
-
-        text = self._extract_text_from_history_content(raw_parts)
-        if not text:
-            return ""
-
-        sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
-        sender_id = str(sender.get("user_id") or sender.get("id") or "").strip()
-        sender_name = str(
-            sender.get("nickname")
-            or sender.get("card")
-            or sender.get("name")
-            or sender_id
-            or "Unknown"
-        ).strip()
-        message_id = self._normalize_message_id(
-            message.get("message_id") or message.get("id") or message.get("real_id") or ""
-        )
-        timestamp = self._format_history_time(message.get("time") or message.get("timestamp"))
-        return f"[{sender_name}/{sender_id}/{timestamp}] #msg{message_id}: {text}"
-
     @staticmethod
     def _history_message_sort_key(message: Any) -> tuple[int, int, int]:
         if not isinstance(message, dict):
@@ -1353,38 +1335,257 @@ class Main(star.Star):
             pass
         return getattr(raw_event, key, None)
 
-    def _remove_current_history_line(
-        self, lines: list[str], current_msg_id: str
-    ) -> list[str]:
-        if not current_msg_id:
-            return [line for line in lines if line]
+    @staticmethod
+    def _onebot_data(result: Any) -> Any:
+        if isinstance(result, dict) and "data" in result:
+            return result.get("data")
+        return result
 
-        normalized_current = self._normalize_message_id(current_msg_id)
-        return [
-            line
-            for line in lines
-            if line
-            and self._normalize_message_id(
-                self._extract_message_id_from_history_line(line)
+    async def _call_onebot_action(
+        self, event: AstrMessageEvent, action: str, **params: Any
+    ) -> Any:
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return None
+
+        api = getattr(bot, "api", None)
+        for target in (api, bot):
+            if target is None:
+                continue
+            call_action = getattr(target, "call_action", None)
+            if callable(call_action):
+                try:
+                    return await call_action(action, **params)
+                except TypeError:
+                    try:
+                        return await call_action(action, params)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.debug(
+                        "enhance-mode | onebot call_action failed | action=%s params=%s error=%s",
+                        action,
+                        params,
+                        e,
+                    )
+            direct = getattr(target, action, None)
+            if callable(direct):
+                try:
+                    return await direct(**params)
+                except Exception as e:
+                    logger.debug(
+                        "enhance-mode | onebot direct api failed | action=%s params=%s error=%s",
+                        action,
+                        params,
+                        e,
+                    )
+        return None
+
+    @staticmethod
+    def _extract_adapter_history_messages(data: Any) -> list[Any]:
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        for key in ("messages", "records", "message", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = Main._extract_adapter_history_messages(value)
+                if nested:
+                    return nested
+        return []
+
+    async def _fetch_adapter_group_history(
+        self, event: AstrMessageEvent, limit: int
+    ) -> list[Any]:
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id or limit <= 0:
+            return []
+
+        raw_payload = self._raw_event_value(event, "raw")
+        current_seq = (
+            self._raw_event_value(event, "message_seq")
+            or self._raw_event_value(event, "real_seq")
+            or self._raw_event_value(event, "msgSeq")
+            or (
+                raw_payload.get("msgSeq")
+                if isinstance(raw_payload, dict)
+                else None
             )
-            != normalized_current
-        ]
+        )
+        group_value = self._numeric_if_digits(group_id)
+        candidates: list[dict[str, Any]] = []
+        if current_seq:
+            candidates.append(
+                {
+                    "group_id": group_value,
+                    "message_seq": self._numeric_if_digits(str(current_seq)),
+                    "count": limit,
+                }
+            )
+        candidates.append({"group_id": group_value, "count": limit})
+        if current_seq:
+            candidates.append(
+                {
+                    "group_id": group_value,
+                    "message_seq": self._numeric_if_digits(str(current_seq)),
+                }
+            )
+        candidates.append({"group_id": group_value})
+
+        for params in candidates:
+            result = await self._call_onebot_action(
+                event,
+                "get_group_msg_history",
+                **params,
+            )
+            messages = self._extract_adapter_history_messages(self._onebot_data(result))
+            if messages:
+                logger.debug(
+                    "enhance-mode | adapter history fetched | origin=%s count=%s params=%s",
+                    event.unified_msg_origin,
+                    len(messages),
+                    params,
+                )
+                return messages
+        return []
+
+    async def _backfill_group_history(
+        self,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        target_count: int,
+    ) -> None:
+        if target_count <= 0 or event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+
+        origin = event.unified_msg_origin
+        fetch_limit = min(
+            cfg.group_history.max_messages,
+            max(target_count * 2, target_count + 5, 10),
+        )
+        try:
+            raw_messages = await self._fetch_adapter_group_history(event, fetch_limit)
+        except Exception as e:
+            logger.debug(
+                "enhance-mode | adapter history backfill failed | origin=%s error=%s",
+                origin,
+                e,
+            )
+            return
+        if not raw_messages:
+            return
+
+        entries: list[dict[str, Any]] = []
+        for message in sorted(raw_messages, key=self._history_message_sort_key):
+            try:
+                entry = await self._format_adapter_history_entry(event, message)
+            except Exception as e:
+                logger.debug(
+                    "enhance-mode | adapter history format failed | origin=%s error=%s",
+                    origin,
+                    e,
+                )
+                continue
+            if entry.get("line"):
+                entries.append(entry)
+        if not entries:
+            return
+
+        self._touch_origin(origin, cfg)
+        chats = self.runtime.session_chats[origin]
+        existing_ids = {
+            self._normalize_message_id(self._extract_message_id_from_history_line(line))
+            for line in chats
+            if self._extract_message_id_from_history_line(line)
+        }
+        existing_lines = set(chats)
+        new_lines: list[str] = []
+        for entry in entries:
+            line = str(entry.get("line") or "")
+            message_id = self._normalize_message_id(entry.get("message_id") or "")
+            if not line:
+                continue
+            if (message_id and message_id in existing_ids) or line in existing_lines:
+                continue
+            new_lines.append(line)
+            existing_lines.add(line)
+            if message_id:
+                existing_ids.add(message_id)
+                self._register_history_image_sources(
+                    origin,
+                    message_id,
+                    list(entry.get("image_urls") or []),
+                    list(entry.get("cache_sources") or []),
+                )
+
+        if not new_lines:
+            return
+        chats[:0] = new_lines
+        if len(chats) > cfg.group_history.max_messages:
+            del chats[: len(chats) - cfg.group_history.max_messages]
+        logger.debug(
+            "enhance-mode | adapter history backfilled | origin=%s added=%s size=%s",
+            origin,
+            len(new_lines),
+            len(chats),
+        )
 
     async def _get_group_context_lines(
-        self, event: AstrMessageEvent, cfg: PluginConfig, exclude_current: bool
+        self,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        exclude_current: bool,
+        limit: int | None = None,
+        exclude_message_ids: set[str] | None = None,
+        backfill_target: int = 0,
     ) -> list[str]:
         origin = event.unified_msg_origin
+        normalized_excluded_ids = {
+            self._normalize_message_id(message_id)
+            for message_id in (exclude_message_ids or set())
+            if self._normalize_message_id(message_id)
+        }
         current_msg_id = self._normalize_message_id(
             getattr(event.message_obj, "message_id", "")
         )
-        cached_lines = list(self.runtime.session_chats.get(origin) or [])
         if exclude_current and current_msg_id:
-            prior_lines = self._remove_current_history_line(cached_lines, current_msg_id)
-        elif exclude_current:
-            prior_lines = cached_lines[:-1] if cached_lines else []
-        else:
-            prior_lines = [line for line in cached_lines if line]
-        return prior_lines[-cfg.group_history.max_messages :]
+            normalized_excluded_ids.add(current_msg_id)
+
+        effective_limit = cfg.group_history.max_messages if limit is None else max(0, limit)
+        if backfill_target > 0 and effective_limit > 0:
+            cached_available = [
+                line
+                for line in (self.runtime.session_chats.get(origin) or [])
+                if line
+                and self._normalize_message_id(
+                    self._extract_message_id_from_history_line(line)
+                )
+                not in normalized_excluded_ids
+            ]
+            if len(cached_available) < min(backfill_target, effective_limit):
+                await self._backfill_group_history(
+                    event,
+                    cfg,
+                    min(backfill_target, effective_limit),
+                )
+
+        cached_lines = list(self.runtime.session_chats.get(origin) or [])
+        prior_lines = []
+        for line in cached_lines:
+            if not line:
+                continue
+            line_msg_id = self._normalize_message_id(
+                self._extract_message_id_from_history_line(line)
+            )
+            if line_msg_id and line_msg_id in normalized_excluded_ids:
+                continue
+            prior_lines.append(line)
+        if exclude_current and not current_msg_id and prior_lines:
+            prior_lines = prior_lines[:-1]
+        return prior_lines[-effective_limit:] if effective_limit > 0 else []
 
     async def _resolve_active_current_message_text(
         self, event: AstrMessageEvent, cfg: PluginConfig
@@ -1400,7 +1601,7 @@ class Main(star.Star):
         current_msg_id = self._normalize_message_id(
             getattr(event.message_obj, "message_id", "")
         )
-        if cfg.group_history_enabled and current_msg_id:
+        if self._history_recording_enabled(cfg) and current_msg_id:
             current_line = self._find_history_line_by_message_id(origin, current_msg_id)
             if current_line:
                 resolved_lines = await self._resolve_image_captions_for_context_lines(
@@ -1464,6 +1665,9 @@ class Main(star.Star):
         cfg: PluginConfig,
         current_message_text: str = "",
         current_message_source: str = "",
+        history_limit: int | None = None,
+        exclude_message_ids: set[str] | None = None,
+        backfill_target: int = 0,
     ) -> dict[str, Any]:
         origin = event.unified_msg_origin
         if not current_message_text:
@@ -1472,11 +1676,19 @@ class Main(star.Star):
             )
 
         recent_history_lines: list[str] = []
-        if cfg.group_history_enabled:
+        effective_history_limit = (
+            cfg.active_reply.unified_context_messages
+            if history_limit is None
+            else max(0, history_limit)
+        )
+        if self._history_recording_enabled(cfg) and effective_history_limit > 0:
             recent_history_lines = await self._get_group_context_lines(
                 event,
                 cfg,
                 exclude_current=True,
+                limit=effective_history_limit,
+                exclude_message_ids=exclude_message_ids,
+                backfill_target=backfill_target,
             )
             recent_history_lines = await self._resolve_image_captions_for_context_lines(
                 event,
@@ -1484,31 +1696,19 @@ class Main(star.Star):
                 recent_history_lines,
             )
 
-        ar = cfg.active_reply
-        history = self.runtime.model_choice_histories[origin]
-        model_choice_history_lines: list[str] = []
-        if ar.model_history_messages > 0:
-            history_candidates = (
-                history[:-ar.model_stack_size]
-                if ar.model_stack_size > 0
-                else list(history)
-            )
-            model_choice_history_lines = history_candidates[-ar.model_history_messages :]
-
         logger.info(
-            "enhance-mode | context collected | origin=%s current_source=%s current_len=%s history_count=%s model_history_count=%s",
+            "enhance-mode | context collected | origin=%s current_source=%s current_len=%s history_count=%s history_limit=%s",
             origin,
             current_message_source or "unknown",
             len(current_message_text),
             len(recent_history_lines),
-            len(model_choice_history_lines),
+            effective_history_limit,
         )
         return {
             "origin": origin,
             "current_message_text": current_message_text,
             "current_message_source": current_message_source or "unknown",
             "recent_history_lines": recent_history_lines,
-            "model_choice_history_lines": model_choice_history_lines,
         }
 
     def _build_active_reply_interaction_instructions(
@@ -1539,26 +1739,13 @@ class Main(star.Star):
         messages: list[str],
         persona_name: str,
         persona_mask: str,
-        group_context_lines: list[str],
         history_context_lines: list[str],
     ) -> str:
         prompt_tmpl = cfg.active_reply.model_choice_prompt
-        injected_history_count = len(group_context_lines) + len(history_context_lines)
-
-        combined_history_context_lines: list[str] = []
-        if group_context_lines:
-            combined_history_context_lines.append(
-                bounded_chat_history_text(group_context_lines)
-            )
-        if history_context_lines:
-            combined_history_context_lines.append(
-                "=== MODEL_CHOICE_HISTORY_BEGIN ===\n"
-                + "\n".join(history_context_lines)
-                + "\n=== MODEL_CHOICE_HISTORY_END ==="
-            )
+        injected_history_count = len(history_context_lines)
         history_context = (
-            "\n\n".join(combined_history_context_lines)
-            if combined_history_context_lines
+            bounded_chat_history_text(history_context_lines)
+            if history_context_lines
             else "(disabled or no additional history)"
         )
 
@@ -1601,7 +1788,7 @@ class Main(star.Star):
             f"{history_text}\n\n"
         )
 
-        if str(active_mode or "").strip().lower() == "model_choice":
+        if str(active_mode or "").strip():
             return (
                 f"{history_prefix}"
                 "You decided to actively join this conversation because some recent messages are worth replying to.\n"
@@ -2441,50 +2628,30 @@ class Main(star.Star):
         trigger_reason: str,
     ) -> bool:
         ar = cfg.active_reply
-        history = self.runtime.model_choice_histories[origin]
-        history_context_lines = []
-        if ar.model_history_messages > 0:
-            history_context_lines = history[-ar.model_history_messages :]
-        group_context_lines: list[str] = []
-        if cfg.group_history_enabled:
-            group_context_lines = await self._get_group_context_lines(
-                event,
-                cfg,
-                exclude_current=False,
-            )
-            if ar.model_choice_max_context_messages > 0:
-                group_context_lines = group_context_lines[
-                    -ar.model_choice_max_context_messages :
-                ]
-            else:
-                group_context_lines = []
-            group_context_lines = await self._resolve_image_captions_for_context_lines(
-                event,
-                cfg,
-                group_context_lines,
-            )
-        injected_history_count = len(group_context_lines) + len(history_context_lines)
-        combined_history_context_lines = []
-        if group_context_lines:
-            combined_history_context_lines.append(
-                bounded_chat_history_text(group_context_lines)
-            )
-        if history_context_lines:
-            combined_history_context_lines.append(
-                "=== MODEL_CHOICE_HISTORY_BEGIN ===\n"
-                + "\n".join(history_context_lines)
-                + "\n=== MODEL_CHOICE_HISTORY_END ==="
-            )
-        history_context = (
-            "\n\n".join(combined_history_context_lines)
-            if combined_history_context_lines
-            else "(disabled or no additional history)"
+        history_limit = (
+            min(ar.model_history_messages, ar.unified_context_messages)
+            if ar.model_history_messages > 0
+            else 0
         )
+        stack_message_ids = {
+            self._normalize_message_id(self._extract_message_id_from_history_line(line))
+            for line in messages
+            if self._extract_message_id_from_history_line(line)
+        }
+        choice_context = await self._collect_active_reply_context(
+            event,
+            cfg,
+            history_limit=history_limit,
+            exclude_message_ids=stack_message_ids,
+            backfill_target=history_limit,
+        )
+        history_context_lines = list(choice_context.get("recent_history_lines") or [])
+        injected_history_count = len(history_context_lines)
 
         logger.info(
             "enhance-mode | model_choice | 开始判定 | "
             f"origin={origin} trigger={trigger_reason} stack_size={len(messages)} "
-            f"history={len(history_context_lines)} group_context={len(group_context_lines)} "
+            f"history={len(history_context_lines)} history_limit={history_limit} "
             f"injected_history={injected_history_count}"
         )
 
@@ -2494,24 +2661,13 @@ class Main(star.Star):
             return False
 
         persona_name, persona_mask = await self._resolve_persona_mask(event)
-        prompt_tmpl = ar.model_choice_prompt
-        try:
-            judge_prompt = prompt_tmpl.format(
-                stack_size=len(messages),
-                messages="\n".join(messages),
-                history_count=injected_history_count,
-                history_context=history_context,
-                persona_name=persona_name,
-                persona_mask=persona_mask,
-            )
-        except Exception:
-            judge_prompt = (
-                f"{prompt_tmpl}\n\n"
-                f"人格面具({persona_name}):\n{persona_mask}\n\n"
-                f"最近消息:\n{chr(10).join(messages)}\n\n"
-                f"额外历史上下文({injected_history_count}):\n{history_context}\n\n"
-                "请仅输出 REPLY 或 SKIP。"
-            )
+        judge_prompt = self._build_model_choice_prompt(
+            cfg,
+            messages,
+            persona_name,
+            persona_mask,
+            history_context_lines,
+        )
 
         try:
             judge_resp = await asyncio.wait_for(
@@ -2561,22 +2717,17 @@ class Main(star.Star):
         nickname = event.message_obj.sender.nickname
         sender_id = event.get_sender_id()
         stack = self.runtime.active_reply_stacks[origin]
-        history = self.runtime.model_choice_histories[origin]
-
-        stack.append(f"[{nickname}/{sender_id}]: {text}")
-        history_line = (
-            f"[{nickname}/{sender_id}/"
-            f"{datetime.datetime.now().strftime('%H:%M:%S')}]: {text}"
+        current_msg_id = self._normalize_message_id(
+            getattr(event.message_obj, "message_id", "")
         )
-        history.append(history_line)
 
-        history_limit = max(
-            60,
-            ar.model_stack_size * 6,
-            ar.model_history_messages * 6,
-        )
-        if len(history) > history_limit:
-            del history[:-history_limit]
+        stack_line = self._find_history_line_by_message_id(origin, current_msg_id)
+        if not stack_line:
+            msg_marker = f" #msg{current_msg_id}:" if current_msg_id else ":"
+            stack_line = f"[{nickname}/{sender_id}]{msg_marker} {text}"
+        stack.append(stack_line)
+        if len(stack) > ar.model_stack_size:
+            del stack[:-ar.model_stack_size]
 
         logger.info(
             "enhance-mode | model_choice | 栈填充 | "
@@ -2756,7 +2907,7 @@ class Main(star.Star):
         if not has_content and not forward_context_text:
             return
 
-        if cfg.group_history_enabled:
+        if self._history_recording_enabled(cfg):
             try:
                 await self._record_message(event, cfg)
             except Exception as e:
@@ -2872,110 +3023,56 @@ class Main(star.Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         cfg = self._cfg()
-        if not cfg.group_history_enabled:
+        if not self._history_recording_enabled(cfg):
             return
 
         is_react_group = (
             cfg.group_features.react_mode_enable
             and event.get_message_type() == MessageType.GROUP_MESSAGE
         )
-        is_active_triggered = False
-        active_mode = ""
-        if is_react_group:
-            is_active_triggered = event.get_extra(
-                "_enhance_active_reply_triggered", False
-            )
-            active_mode = event.get_extra("_enhance_active_reply_mode", "")
+        if not is_react_group:
+            return
 
-        if is_react_group and is_active_triggered:
+        is_active_triggered = event.get_extra(
+            "_enhance_active_reply_triggered", False
+        )
+        active_mode = event.get_extra("_enhance_active_reply_mode", "")
+
+        if is_active_triggered:
             active_prompt = str(
                 self._get_extra_value(event, ENHANCE_ACTIVE_REPLY_PROMPT_KEY, "")
                 or req.prompt
                 or ""
             )
-            if active_prompt:
-                req.prompt = active_prompt
-                req.contexts = []
-                logger.info(
-                    "enhance-mode | active_reply prompt injected | origin=%s mode=%s prompt_len=%s",
-                    event.unified_msg_origin,
-                    active_mode or "unknown",
-                    len(active_prompt),
+            if not active_prompt:
+                active_context = await self._collect_active_reply_context(event, cfg)
+                active_prompt = self._build_active_reply_prompt(
+                    cfg,
+                    active_context,
+                    str(active_mode or cfg.active_reply.mode),
                 )
-            return
-
-        bounded_chats = ""
-        context_lines = await self._get_group_context_lines(
-            event,
-            cfg,
-            exclude_current=False,
-        )
-        if not context_lines:
-            return
-
-        self._touch_origin(event.unified_msg_origin, cfg)
-        context_lines = await self._resolve_image_captions_for_context_lines(
-            event,
-            cfg,
-            context_lines,
-        )
-        bounded_chats = bounded_chat_history_text(context_lines)
-        logger.debug(
-            "enhance-mode | injecting group context | origin=%s history_size=%s",
-            event.unified_msg_origin,
-            len(context_lines),
-        )
-        interaction_instructions = build_interaction_instructions(
-            cfg.group_features.mention_parse,
-            cfg.group_history.include_sender_id,
-            cfg.group_features.refuse_enable,
-        )
-        interaction_instructions += (
-            "\nIf a history message contains `[Image]` and visual details are necessary, "
-            "you may call `enhance_use_image(message_id, image_index, attach_to_model, write_to_history, prompt)`. "
-            "By default it does both: attach image to this run context and write description back into chat history. "
-            "Set `attach_to_model=false` for history-only. "
-            "Set `write_to_history=false` for attach-only."
-        )
-        if cfg.web_search.enable:
-            interaction_instructions += (
-                "\nWhen real-time facts or uncertain external information are needed, "
-                "you may call `grok_web_search(query)`."
-            )
-
-        if is_react_group:
-            history_prefix = (
-                "You are now in a chatroom. The chat history is as follows:\n"
-                f"{bounded_chats}\n\n"
-            )
-            if is_active_triggered and active_mode == "model_choice":
-                req.prompt = (
-                    f"{history_prefix}"
-                    "You decided to actively join this conversation because some recent messages are worth replying to.\n"
-                    "Choose the message(s) you want to respond to from the chat history, "
-                    "and compose a natural reply. Quote the message you choose in most cases.\n"
-                    "Only output your response and do not output any other information. "
-                    "You MUST use the SAME language as the chatroom is using."
-                    f"{interaction_instructions}"
-                )
-            else:
-                prompt = self._get_forward_context_text(event) or req.prompt
-                req.prompt = (
-                    f"{history_prefix}"
-                    f"Now, a new message is coming: `{prompt}`. "
-                    "Please react to it. Your entire output is your reply to this message. "
-                    "Quote the message which is coming in most cases. "
-                    "Only output your response and do not output any other information. "
-                    "You MUST use the SAME language as the chatroom is using."
-                    f"{interaction_instructions}"
-                )
+            req.prompt = active_prompt
             req.contexts = []
-        else:
-            req.system_prompt += (
-                "You are now in a chatroom. The chat history is as follows: \n"
+            logger.info(
+                "enhance-mode | active_reply prompt injected | origin=%s mode=%s prompt_len=%s",
+                event.unified_msg_origin,
+                active_mode or "unknown",
+                len(active_prompt),
             )
-            req.system_prompt += bounded_chats
-            req.system_prompt += interaction_instructions
+            return
+
+        passive_context = await self._collect_active_reply_context(event, cfg)
+        req.prompt = self._build_active_reply_prompt(
+            cfg,
+            passive_context,
+            active_mode="",
+        )
+        req.contexts = []
+        logger.info(
+            "enhance-mode | passive prompt injected | origin=%s prompt_len=%s",
+            event.unified_msg_origin,
+            len(req.prompt or ""),
+        )
 
     @filter.on_decorating_result()
     async def parse_tags(self, event: AstrMessageEvent) -> None:
@@ -3013,7 +3110,7 @@ class Main(star.Star):
         self, event: AstrMessageEvent, resp: LLMResponse
     ) -> None:
         cfg = self._cfg()
-        if not cfg.group_history_enabled:
+        if not self._history_recording_enabled(cfg):
             return
         if event.unified_msg_origin not in self.runtime.session_chats:
             return

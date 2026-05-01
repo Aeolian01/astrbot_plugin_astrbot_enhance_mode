@@ -1,7 +1,7 @@
 {
     "group_history_enhancement": {
         "description": "群聊历史增强",
-        "hint": "以增强格式记录群聊消息并注入 LLM 上下文。依赖「群聊功能增强 -> React 模式」开启。",
+        "hint": "以增强格式记录群聊消息，作为被动回复、主动回复与模型判定的统一历史来源。依赖「群聊功能增强 -> React 模式」开启。",
         "type": "object",
         "items": {
             "enable": {
@@ -78,11 +78,11 @@
                 "type": "bool",
                 "default": true
             },
-            "model_choice_max_context_messages": {
-                "description": "模型判定最多上下文",
-                "hint": "当 mode=model_choice 时生效，判定 prompt 最多注入最近多少条群聊上下文。设为 0 表示不注入群聊上下文。",
+            "unified_context_messages": {
+                "description": "统一历史窗口",
+                "hint": "被动回复、主动回复与模型判定最多注入多少条统一群聊历史。设为 0 表示不注入历史但仍记录历史。",
                 "type": "int",
-                "default": 6
+                "default": 20
             },
             "model_stack_size": {
                 "description": "模型触发栈长度",
@@ -92,7 +92,7 @@
             },
             "model_history_messages": {
                 "description": "模型判定历史条数",
-                "hint": "当 mode=model_choice 时生效，判定时附带的额外历史消息条数（0 表示不附带）。",
+                "hint": "当 mode=model_choice 时生效，判定时从统一历史中附带的额外历史条数（0 表示不附带，也不触发平台历史补足）。实际注入数量不超过统一历史窗口。",
                 "type": "int",
                 "default": 0
             },
@@ -105,9 +105,9 @@
             },
             "model_choice_prompt": {
                 "description": "模型判定提示词",
-                "hint": "可使用 {stack_size}、{messages}、{history_count}、{history_context}、{persona_name}、{persona_mask} 占位符；{history_count} 为实际注入的群聊上下文和额外判定历史总数，模型需只输出 REPLY 或 SKIP。",
+                "hint": "可使用 {stack_size}、{messages}、{history_count}、{history_context}、{persona_name}、{persona_mask} 占位符；模型需只输出 REPLY 或 SKIP。",
                 "type": "string",
-                "default": "你是一个二分类判定器，不是聊天机器人。\n你的唯一任务是判断当前人格是否应该在群聊中主动回复。\n\n当前人格面具：{persona_name}\n人格设定：\n{persona_mask}\n\n输出规则必须严格遵守：\n- 如果应该主动回复，只输出：REPLY\n- 如果不应该主动回复，只输出：SKIP\n- 禁止输出解释、推理过程、标点、表情、中文或其它任何内容\n- 禁止直接生成群聊回复内容\n\n最近 {stack_size} 条群聊消息：\n{messages}\n\n额外历史上下文（最近 {history_count} 条）：\n{history_context}\n\n最终答案只能是 REPLY 或 SKIP："
+                "default": "你是一个群聊主动回复二分类判定器，不是聊天机器人。\n你的唯一任务是判断当前人格是否应该主动加入这段群聊。\n\n当前人格名称：{persona_name}\n当前人格设定：\n{persona_mask}\n\n判定标准：\n- 明确点名、询问、测试机器人状态、需要当前人格回应：REPLY\n- 普通闲聊、无关内容、不需要当前人格介入：SKIP\n- 不确定时：SKIP\n\n严格输出规则：\n- 只能输出一个大写英文单词：REPLY 或 SKIP\n- 禁止解释、理由、标点、表情、Markdown、中文\n- 禁止生成真正要发送到群里的回复内容\n- 任何额外字符都会被程序视为无效输出\n\n=== RECENT_MESSAGES_BEGIN ===\n{messages}\n\n=== RECENT_MESSAGES_END ===\n\n=== HISTORY_CONTEXT_BEGIN ===\n{history_context}\n\n=== HISTORY_CONTEXT_END ===\n\n最终答案，只能是 REPLY 或 SKIP："
             },
             "whitelist": {
                 "description": "白名单",

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 
-from astrbot_plugin_astrbot_enhance_mode.plugin_config import parse_plugin_config
+from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
+    DEFAULT_MODEL_CHOICE_PROMPT,
+    parse_plugin_config,
+)
 
 
 def test_parse_plugin_config_defaults() -> None:
@@ -11,6 +16,7 @@ def test_parse_plugin_config_defaults() -> None:
     assert cfg.active_reply.enable is False
     assert cfg.active_reply.mode == "probability"
     assert cfg.active_reply.model_choice_provider_id == ""
+    assert cfg.active_reply.unified_context_messages == 20
     assert math.isclose(cfg.active_reply.possibility, 0.1)
     assert cfg.group_history_enabled is False
     assert cfg.active_reply_enabled is False
@@ -40,6 +46,7 @@ def test_active_reply_mode_and_limits_are_normalized() -> None:
         {
             "active_reply": {
                 "mode": "something_else",
+                "unified_context_messages": -10,
                 "model_stack_size": 0,
                 "model_history_messages": -99,
                 "model_choice_provider_id": "  provider-1  ",
@@ -53,6 +60,7 @@ def test_active_reply_mode_and_limits_are_normalized() -> None:
     )
 
     assert cfg.active_reply.mode == "probability"
+    assert cfg.active_reply.unified_context_messages == 0
     assert cfg.active_reply.model_stack_size == 1
     assert cfg.active_reply.model_history_messages == 0
     assert cfg.active_reply.model_choice_provider_id == "provider-1"
@@ -76,3 +84,12 @@ def test_web_search_request_mode_and_base_override_are_normalized() -> None:
 
     cfg_invalid = parse_plugin_config({"web_search": {"request_mode": "unknown"}})
     assert cfg_invalid.web_search.request_mode == "auto"
+
+
+def test_schema_model_choice_prompt_matches_default() -> None:
+    schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert (
+        schema["active_reply"]["items"]["model_choice_prompt"]["default"]
+        == DEFAULT_MODEL_CHOICE_PROMPT
+    )

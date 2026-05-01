@@ -9,7 +9,7 @@
 
 - 面向群聊场景的 React 上下文增强，支持消息编号、角色标签、发送者 ID 与图片占位记录。
 - 主动回复支持概率触发与模型判定触发，并可为判定流程指定独立 Provider。
-- 主动回复可在无当前 AstrBot 对话时自动创建空会话；正式回复 prompt 由 enhance-mode 显式组装并注入，不再依赖自动 seed 会话历史。
+- 被动回复、主动回复和 `model_choice` 判定共用同一套群聊历史上下文，统一由 enhance-mode 显式组装 prompt。
 - 支持 `<mention/>`、`<quote/>`、`<refuse/>` 控制标签，把模型输出转换为平台消息组件或主动取消发送。
 - 提供 Bot 侧封禁控制、可检索长期记忆、联网搜索工具与记忆管理 WebUI。
 - 可消费 `astrbot_plugin_forward_context` 的合并转发解析结果，让转发消息进入主动回复判定和历史上下文。
@@ -24,7 +24,7 @@
 
 - 平台历史补齐注入时，若历史消息包含合并转发、嵌套转发、JSON/Ark 分享卡片，会调用 forward-context 公共解析 API 展开后再写入上下文。
 - 图片历史注入会优先复用 forward-context 的共享图片描述缓存，并把新解析结果写回共享缓存。
-- active reply 正式回复阶段改为显式 prompt 注入，不再依赖“自动创建会话后再 seed 最近群聊上下文”。
+- 被动回复、active reply 正式回复和 `model_choice` 判定改为共用统一历史窗口，不再维护 model_choice 专用历史池。
 - `active_reply.seed_context_on_auto_create` 已移除；`auto_create_conversation` 仅表示是否自动创建空会话容器。
 
 ## Features
@@ -32,7 +32,7 @@
 ### Group Chat Enhancement
 
 - React 模式（群聊上下文增强总开关）
-- 群聊历史增强（可注入发送者 ID、角色标签、消息编号）
+- 群聊历史增强（可注入发送者 ID、角色标签、消息编号，并作为统一历史来源）
 - 图片转述（可选，历史先记录 `[Image]`，注入上下文时自动解析并回填历史）
 - 支持消费 `astrbot_plugin_forward_context` 写入的合并转发解析文本
 - 角色显示（在 system reminder 注入 `admin/member`）
@@ -43,7 +43,7 @@
 - `model_choice` 模型判定触发（支持人格面具占位符）
 - 白名单控制（按 `unified_msg_origin` 或群号）
 - 可自动创建缺失的 AstrBot 对话，但不会再向新会话自动 seed 最近群聊上下文
-- 缓存历史不足时可通过平台适配器查询 QQ 群最新历史进行补齐
+- `model_choice` 判定历史不足时可通过平台适配器查询 QQ 群最新历史进行补齐
 - 正式回复阶段由 enhance-mode 显式组装最终 prompt 并注入 `req.prompt`
 
 ### Output Tags
@@ -137,10 +137,9 @@ event.get_extra("_forward_context_ids")
 - `mode`：`probability` 或 `model_choice`
 - `possibility`：概率触发时生效
 - `auto_create_conversation`：主动回复触发但当前群没有 AstrBot 对话时，自动创建并切换到新会话
-- `min_seed_context_messages`：上下文补齐阈值；缓存历史不足时，允许通过平台适配器查询最新群历史补齐。设为 `0` 可关闭补齐查询
-- `model_choice_max_context_messages`：`model_choice` 判定最多注入多少条群聊上下文
+- `unified_context_messages`：被动回复、主动回复与模型判定最多注入多少条统一群聊历史；`0` 表示不注入历史但仍记录历史
 - `model_stack_size`：`model_choice` 触发栈长度
-- `model_history_messages`：`model_choice` 额外历史条数
+- `model_history_messages`：`model_choice` 从统一历史中额外附带的判定历史条数；`0` 表示不附带，也不触发平台历史补足
 - `model_choice_provider_id`：判定模型提供商 ID
 - `model_choice_prompt`：判定提示词，支持占位符
 - `whitelist`：来源/群号白名单
@@ -149,7 +148,7 @@ event.get_extra("_forward_context_ids")
 
 - `active_reply.seed_context_on_auto_create` 已移除。
 - `auto_create_conversation` 现在只负责创建空会话，不再承担 seed 历史的职责。
-- active reply 正式回复阶段使用 enhance-mode 显式组装的最终 prompt。
+- 模型判定历史注入窗口统一由 `unified_context_messages` 控制。
 
 ## LLM Tools
 

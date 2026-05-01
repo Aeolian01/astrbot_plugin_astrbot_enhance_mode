@@ -2,7 +2,8 @@
 
 ## 配置与文档
 - [ ] 删除 `plugin_config.py` 中的 `seed_context_on_auto_create`
-- [ ] 删除 `plugin_config.py` 中的 `min_seed_context_messages`
+- [ ] 删除 `plugin_config.py` 中的旧模型判定上下文字段
+- [ ] 新增 `plugin_config.py` 中的 `unified_context_messages`
 - [ ] 删除 `_conf_schema.json` 中对应配置项
 - [ ] 更新 README，移除“自动 seed 最近群聊上下文”说明
 - [ ] 更新 README，补充“active reply 改为显式 prompt 注入”说明

@@ -75,7 +75,6 @@ async def _collect_active_reply_context(self, event, cfg) -> dict[str, Any]:
     "origin": origin,
     "current_message_text": current_message_text,
     "recent_history_lines": recent_history_lines,
-    "model_choice_history_lines": model_choice_history_lines,
 }
 ```
 
@@ -151,7 +150,7 @@ active reply 统一改成：
 以下配置项删除：
 
 - `seed_context_on_auto_create`
-- `min_seed_context_messages`
+- 旧模型判定上下文字段
 
 原因：
 - 它们只服务于“自动建会话 + 再灌历史”这条旧链路
@@ -185,7 +184,8 @@ active reply 统一改成：
 
 动作：
 - 删除 `seed_context_on_auto_create`
-- 删除 `min_seed_context_messages`
+- 删除旧模型判定上下文字段
+- 新增 `unified_context_messages`
 - 更新说明：active reply 不再通过 auto seed 灌入群聊上下文
 
 ---

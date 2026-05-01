@@ -3,20 +3,26 @@ from dataclasses import dataclass, field
 from typing import Any
 
 DEFAULT_MODEL_CHOICE_PROMPT = (
-    "你是一个二分类判定器，不是聊天机器人。\n"
-    "你的唯一任务是判断当前人格是否应该在群聊中主动回复。\n\n"
-    "当前人格面具：{persona_name}\n"
-    "人格设定：\n{persona_mask}\n\n"
-    "输出规则必须严格遵守：\n"
-    "- 如果应该主动回复，只输出：REPLY\n"
-    "- 如果不应该主动回复，只输出：SKIP\n"
-    "- 禁止输出解释、推理过程、标点、表情、中文或其它任何内容\n"
-    "- 禁止直接生成群聊回复内容\n\n"
-    "最近 {stack_size} 条群聊消息：\n"
+    "你是一个群聊主动回复二分类判定器，不是聊天机器人。\n"
+    "你的唯一任务是判断当前人格是否应该主动加入这段群聊。\n\n"
+    "当前人格名称：{persona_name}\n"
+    "当前人格设定：\n{persona_mask}\n\n"
+    "判定标准：\n"
+    "- 明确点名、询问、测试机器人状态、需要当前人格回应：REPLY\n"
+    "- 普通闲聊、无关内容、不需要当前人格介入：SKIP\n"
+    "- 不确定时：SKIP\n\n"
+    "严格输出规则：\n"
+    "- 只能输出一个大写英文单词：REPLY 或 SKIP\n"
+    "- 禁止解释、理由、标点、表情、Markdown、中文\n"
+    "- 禁止生成真正要发送到群里的回复内容\n"
+    "- 任何额外字符都会被程序视为无效输出\n\n"
+    "=== RECENT_MESSAGES_BEGIN ===\n"
     "{messages}\n\n"
-    "额外历史上下文（最近 {history_count} 条）：\n"
+    "=== RECENT_MESSAGES_END ===\n\n"
+    "=== HISTORY_CONTEXT_BEGIN ===\n"
     "{history_context}\n\n"
-    "最终答案只能是 REPLY 或 SKIP："
+    "=== HISTORY_CONTEXT_END ===\n\n"
+    "最终答案，只能是 REPLY 或 SKIP："
 )
 DEFAULT_WEB_SEARCH_SYSTEM_PROMPT = (
     "You are a web research assistant. Use live web search/browsing when answering. "
@@ -96,7 +102,7 @@ class ActiveReplyConfig:
     mode: str = "probability"
     possibility: float = 0.1
     auto_create_conversation: bool = True
-    model_choice_max_context_messages: int = 6
+    unified_context_messages: int = 20
     model_stack_size: int = 8
     model_history_messages: int = 0
     model_choice_provider_id: str = ""
@@ -227,8 +233,8 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         auto_create_conversation=_to_bool(
             active_reply_raw.get("auto_create_conversation"), True
         ),
-        model_choice_max_context_messages=max(
-            0, _to_int(active_reply_raw.get("model_choice_max_context_messages"), 6)
+        unified_context_messages=max(
+            0, _to_int(active_reply_raw.get("unified_context_messages"), 20)
         ),
         model_stack_size=max(1, _to_int(active_reply_raw.get("model_stack_size"), 8)),
         model_history_messages=max(
