@@ -1425,27 +1425,34 @@ class Main(star.Star):
             break
 
         group_value = self._numeric_if_digits(group_id)
-        candidates: list[dict[str, Any]] = []
+        candidates: list[tuple[dict[str, Any], str]] = [
+            ({"group_id": group_value, "count": limit}, "none"),
+            ({"group_id": group_value}, "none"),
+        ]
         if current_seq:
-            candidates.append(
-                {
-                    "group_id": group_value,
-                    "message_seq": self._numeric_if_digits(str(current_seq)),
-                    "count": limit,
-                }
+            seq_value = self._numeric_if_digits(str(current_seq))
+            candidates.extend(
+                [
+                    (
+                        {
+                            "group_id": group_value,
+                            "message_seq": seq_value,
+                            "count": limit,
+                        },
+                        current_seq_source,
+                    ),
+                    (
+                        {
+                            "group_id": group_value,
+                            "message_seq": seq_value,
+                        },
+                        current_seq_source,
+                    ),
+                ]
             )
-        candidates.append({"group_id": group_value, "count": limit})
-        if current_seq:
-            candidates.append(
-                {
-                    "group_id": group_value,
-                    "message_seq": self._numeric_if_digits(str(current_seq)),
-                }
-            )
-        candidates.append({"group_id": group_value})
 
         best_messages: list[Any] = []
-        for params in candidates:
+        for params, seq_source in candidates:
             result = await self._call_onebot_action(
                 event,
                 "get_group_msg_history",
@@ -1459,7 +1466,7 @@ class Main(star.Star):
                     "enhance-mode | adapter history fetched | origin=%s count=%s seq_source=%s params=%s",
                     event.unified_msg_origin,
                     len(messages),
-                    current_seq_source or "none",
+                    seq_source or "none",
                     params,
                 )
                 if len(messages) >= min(limit, 2):
