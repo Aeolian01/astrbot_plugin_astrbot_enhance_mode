@@ -78,15 +78,9 @@
                 "type": "bool",
                 "default": true
             },
-            "seed_context_on_auto_create": {
-                "description": "新会话附带群聊上下文",
-                "hint": "自动创建会话时，将最近群聊上下文写入新会话初始历史。本轮请求会避免重复 prompt 注入。依赖群聊历史增强开启。",
-                "type": "bool",
-                "default": true
-            },
             "min_seed_context_messages": {
                 "description": "上下文补齐阈值",
-                "hint": "注入群聊上下文前，如果缓存可用历史少于该条数，会尝试通过平台适配器查询 QQ 群最新历史补齐，并最多补齐该条数；设为 0 可关闭补齐查询。",
+                "hint": "如果缓存可用历史较少，会尝试通过平台适配器查询 QQ 群最新历史补齐。设为 0 可关闭补齐查询。",
                 "type": "int",
                 "default": 6
             },
