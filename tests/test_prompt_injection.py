@@ -72,3 +72,35 @@ async def test_passive_injection_uses_request_prompt_for_empty_plugin_event() ->
     assert "Alice 戳了你一下，请用一句话回复。" in req.prompt
     assert "[Empty]" not in req.prompt
     assert req.contexts == []
+
+
+@pytest.mark.asyncio
+async def test_passive_injection_backfills_history_for_empty_plugin_event() -> None:
+    plugin = _build_plugin()
+    event = _DummyEvent()
+    req = _DummyRequest("Alice 戳了你一下，请用一句话回复。")
+    called = {"backfill": False}
+
+    async def backfill_group_history(
+        backfill_event: _DummyEvent,
+        _cfg: PluginConfig,
+        target_count: int,
+    ) -> None:
+        called["backfill"] = True
+        assert backfill_event is event
+        assert target_count == 5
+        plugin.runtime.session_chats[event.unified_msg_origin].extend(
+            [
+                "[Bob/1/12:00:00] #msg1: 刚才大家在聊午饭",
+                "[Alice/2/12:00:01] #msg2: 有没有人想喝奶茶",
+            ]
+        )
+
+    plugin._backfill_group_history = backfill_group_history
+
+    await plugin.inject_group_context(event, req)
+
+    assert called["backfill"] is True
+    assert "刚才大家在聊午饭" in req.prompt
+    assert "有没有人想喝奶茶" in req.prompt
+    assert "(no recent group chat history)" not in req.prompt

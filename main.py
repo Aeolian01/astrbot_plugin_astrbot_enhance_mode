@@ -1687,6 +1687,7 @@ class Main(star.Star):
         current_message_text: str = "",
         current_message_source: str = "",
         history_limit: int | None = None,
+        exclude_current: bool = True,
         exclude_message_ids: set[str] | None = None,
         backfill_target: int = 0,
     ) -> dict[str, Any]:
@@ -1706,7 +1707,7 @@ class Main(star.Star):
             recent_history_lines = await self._get_group_context_lines(
                 event,
                 cfg,
-                exclude_current=True,
+                exclude_current=exclude_current,
                 limit=effective_history_limit,
                 exclude_message_ids=exclude_message_ids,
                 backfill_target=backfill_target,
@@ -2952,7 +2953,11 @@ class Main(star.Star):
                     event.set_extra("_enhance_active_reply_triggered", True)
                     event.set_extra("_enhance_active_reply_mode", cfg.active_reply.mode)
 
-                active_context = await self._collect_active_reply_context(event, cfg)
+                active_context = await self._collect_active_reply_context(
+                    event,
+                    cfg,
+                    backfill_target=cfg.active_reply.unified_context_messages,
+                )
                 active_prompt = self._build_active_reply_prompt(
                     cfg,
                     active_context,
@@ -3066,7 +3071,11 @@ class Main(star.Star):
                 or ""
             )
             if not active_prompt:
-                active_context = await self._collect_active_reply_context(event, cfg)
+                active_context = await self._collect_active_reply_context(
+                    event,
+                    cfg,
+                    backfill_target=cfg.active_reply.unified_context_messages,
+                )
                 active_prompt = self._build_active_reply_prompt(
                     cfg,
                     active_context,
@@ -3099,6 +3108,8 @@ class Main(star.Star):
             cfg,
             current_message_text=current_message_text,
             current_message_source=current_message_source,
+            exclude_current=current_message_source != "provider_request.prompt",
+            backfill_target=cfg.active_reply.unified_context_messages,
         )
         req.prompt = self._build_active_reply_prompt(
             cfg,
