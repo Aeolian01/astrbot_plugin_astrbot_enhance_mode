@@ -6,6 +6,9 @@ from mcp import types as mcp_types
 import pytest
 
 from astrbot_plugin_astrbot_enhance_mode.main import Main
+from astrbot_plugin_astrbot_enhance_mode.image_registry_store import (
+    ImageMessageRegistryStore,
+)
 from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     GlobalSettingsConfig,
     GroupFeatureEnhancementConfig,
@@ -23,6 +26,7 @@ class _DummyEvent:
 def _build_plugin(*, image_caption: bool) -> tuple[Main, _DummyEvent]:
     plugin = Main.__new__(Main)
     plugin.runtime = RuntimeState()
+    plugin._image_caption_inflight = {}
     cfg = PluginConfig(
         group_history=GroupHistoryEnhancementConfig(enable=True, image_caption=image_caption),
         group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
@@ -81,6 +85,49 @@ async def test_use_image_attach_only_works_without_caption_enabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_use_image_can_use_registry_restored_from_json(tmp_path) -> None:
+    store = ImageMessageRegistryStore(tmp_path / "image_message_registry.json")
+    store.save(
+        {
+            "origin-1": {
+                "123": {
+                    "urls": ["https://example.com/restored.png"],
+                    "cache_sources": ["fileid:restored"],
+                    "captions": {},
+                    "updated_at": 1000,
+                }
+            }
+        },
+        max_messages_per_origin=10,
+        max_origins=10,
+    )
+    plugin, event = _build_plugin(image_caption=False)
+    plugin.runtime.image_message_registry.update(store.load())
+
+    async def resolve_local_path(_image_ref: str) -> str:
+        return "/tmp/restored-image.png"
+
+    plugin._resolve_image_ref_to_local_path = resolve_local_path
+    plugin._encode_image_file = lambda _path: ("cmVzdG9yZWQ=", "image/png")
+
+    results = []
+    async for item in plugin.use_image(
+        event=event,
+        message_id="123",
+        image_index=1,
+        attach_to_model=True,
+        write_to_history=False,
+    ):
+        results.append(item)
+
+    assert len(results) == 2
+    assert isinstance(results[0].content[0], mcp_types.ImageContent)
+    payload = _payload_from_results(results)
+    assert payload["success"] is True
+    assert payload["attach_success"] is True
+
+
+@pytest.mark.asyncio
 async def test_use_image_default_mode_attaches_and_writes_history() -> None:
     plugin, event = _build_plugin(image_caption=True)
     applied: dict[str, object] = {}
@@ -123,6 +170,40 @@ async def test_use_image_default_mode_attaches_and_writes_history() -> None:
     assert applied["message_id"] == "123"
     assert applied["image_index"] == 0
     assert applied["caption"] == "A test caption"
+
+
+@pytest.mark.asyncio
+async def test_use_image_persists_generated_caption(tmp_path) -> None:
+    plugin, event = _build_plugin(image_caption=True)
+    plugin.image_registry_store = ImageMessageRegistryStore(
+        tmp_path / "image_message_registry.json"
+    )
+
+    async def get_image_caption(*args, **kwargs):  # noqa: ANN002, ANN003
+        return "Persisted caption"
+
+    plugin._get_image_caption = get_image_caption
+    plugin._apply_image_caption_to_history = lambda **_kwargs: True
+    plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/image.png"],
+        "cache_sources": ["fileid:persisted"],
+        "captions": {},
+        "updated_at": 1000,
+    }
+
+    results = []
+    async for item in plugin.use_image(
+        event=event,
+        message_id="123",
+        image_index=1,
+        attach_to_model=False,
+        write_to_history=True,
+    ):
+        results.append(item)
+
+    assert _payload_from_results(results)["success"] is True
+    restored = plugin.image_registry_store.load()
+    assert restored["origin-1"]["123"]["captions"]["0"] == "Persisted caption"
 
 
 @pytest.mark.asyncio

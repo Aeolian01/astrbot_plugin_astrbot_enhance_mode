@@ -11,6 +11,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -45,6 +46,7 @@ except Exception:
         return None
 
 from .ban_control import BanStore, parse_duration_seconds
+from .image_registry_store import ImageMessageRegistryStore
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
 from .runtime_state import RuntimeState
@@ -61,11 +63,13 @@ from .webui import RAGWebUIServer
 
 IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
 MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
+IMAGE_SOURCE_VOLATILE_QUERY_KEYS = {"rkey", "ukey", "token", "sig", "sign"}
 FORWARD_CONTEXT_TEXT_KEY = "_forward_context_text"
 FORWARD_CONTEXT_FOUND_KEY = "_forward_context_found"
 FORWARD_CONTEXT_IDS_KEY = "_forward_context_ids"
 ENHANCE_ACTIVE_REPLY_PROMPT_KEY = "_enhance_active_reply_prompt"
 ACTIVE_MESSAGE_TEXT_LIMIT = 4000
+ACTIVE_REPLY_PENDING_TTL_SEC = 180.0
 
 
 class Main(star.Star):
@@ -81,6 +85,12 @@ class Main(star.Star):
             / "plugin_data"
             / "astrbot_plugin_astrbot_enhance_mode"
         )
+        self.image_registry_store = ImageMessageRegistryStore(
+            plugin_data_dir / "image_message_registry.json"
+        )
+        loaded_image_registry = self.image_registry_store.load()
+        if loaded_image_registry:
+            self.runtime.image_message_registry.update(loaded_image_registry)
         self.ban_store = BanStore(plugin_data_dir / "ban_list.db")
         self.memory_rag_store: MemoryRAGStore | None = None
         self.rag_webui_server: RAGWebUIServer | None = None
@@ -92,17 +102,39 @@ class Main(star.Star):
         except Exception as e:
             logger.error(f"enhance-mode | 初始化记忆 RAG 存储失败: {e}", exc_info=True)
         logger.info(
-            "enhance-mode | plugin initialized | data_dir=%s memory_rag_store_ready=%s timezone=%s",
+            "enhance-mode | plugin initialized | data_dir=%s memory_rag_store_ready=%s timezone=%s image_registry_origins=%s",
             plugin_data_dir,
             self.memory_rag_store is not None,
             self._display_timezone,
+            len(loaded_image_registry),
         )
 
     def _cfg(self) -> PluginConfig:
         return parse_plugin_config(self.config)
 
     def _touch_origin(self, origin: str, cfg: PluginConfig) -> None:
+        image_origins_before = set(self.runtime.image_message_registry.keys())
         self.runtime.touch_origin(origin, cfg.global_settings.lru_cache.max_origins)
+        if image_origins_before != set(self.runtime.image_message_registry.keys()):
+            self._persist_image_registry(cfg)
+
+    def _persist_image_registry(self, cfg: PluginConfig | None = None) -> None:
+        store = getattr(self, "image_registry_store", None)
+        if store is None:
+            return
+        if cfg is None:
+            cfg = self._cfg()
+        try:
+            store.save(
+                self.runtime.image_message_registry,
+                max_messages_per_origin=cfg.group_history.max_messages * 3,
+                max_origins=cfg.global_settings.lru_cache.max_origins,
+            )
+        except Exception as e:
+            logger.debug(
+                "enhance-mode | image registry persist failed | error=%s",
+                e,
+            )
 
     @staticmethod
     def _get_extra_value(
@@ -334,6 +366,35 @@ class Main(star.Star):
             type(comp).__name__.strip().lower() == "poke" for comp in message_chain
         )
 
+    def _has_active_reply_pending(
+        self, origin: str, now: float | None = None
+    ) -> bool:
+        if not origin:
+            return False
+        pending_at = self.runtime.active_reply_pending.get(origin)
+        if pending_at is None:
+            return False
+
+        current = time.monotonic() if now is None else now
+        age = current - pending_at
+        if age > ACTIVE_REPLY_PENDING_TTL_SEC:
+            self.runtime.active_reply_pending.pop(origin, None)
+            logger.info(
+                "enhance-mode | active_reply pending expired | origin=%s age=%.1fs",
+                origin,
+                age,
+            )
+            return False
+        return True
+
+    def _mark_active_reply_pending(self, origin: str) -> None:
+        if origin:
+            self.runtime.active_reply_pending[origin] = time.monotonic()
+
+    def _clear_active_reply_pending(self, origin: str) -> None:
+        if origin:
+            self.runtime.active_reply_pending.pop(origin, None)
+
     async def _build_active_message_text(
         self, event: AstrMessageEvent, cfg: PluginConfig
     ) -> str:
@@ -460,12 +521,46 @@ class Main(star.Star):
         return False
 
     @staticmethod
-    def _image_caption_sources(image_url: str, cache_source: str = "") -> list[str]:
+    def _image_source_url_aliases(source: str) -> list[str]:
+        clean = str(source or "").strip()
+        if not clean.startswith(("http://", "https://")):
+            return []
+        try:
+            parsed = urlparse(clean)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            aliases: list[str] = []
+            fileid = str(qs.get("fileid", [""])[0] or "").strip()
+            if fileid:
+                aliases.append(f"fileid:{fileid}")
+            for volatile_key in IMAGE_SOURCE_VOLATILE_QUERY_KEYS:
+                qs.pop(volatile_key, None)
+            normalized_query = urlencode(qs, doseq=True)
+            normalized_url = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    normalized_query,
+                    "",
+                )
+            )
+            if normalized_url and normalized_url != clean:
+                aliases.append(normalized_url)
+            return aliases
+        except Exception:
+            return []
+
+    @classmethod
+    def _image_caption_sources(cls, image_url: str, cache_source: str = "") -> list[str]:
         sources: list[str] = []
         for candidate in (cache_source, image_url):
             clean = str(candidate or "").strip()
             if clean and clean not in sources:
                 sources.append(clean)
+            for alias in cls._image_source_url_aliases(clean):
+                if alias and alias not in sources:
+                    sources.append(alias)
         return sources
 
     @staticmethod
@@ -497,6 +592,7 @@ class Main(star.Star):
                     "enhance-mode | shared image caption cache hit | source=%s",
                     source,
                 )
+                await self._write_shared_image_caption_cache(sources, caption)
                 return caption
         return ""
 
@@ -583,6 +679,7 @@ class Main(star.Star):
         resolved_lines: list[str] = []
         resolved_count = 0
         failed_count = 0
+        registry_changed = False
         for line in lines:
             current_line = line
             message_id = self._extract_message_id_from_history_line(line)
@@ -649,6 +746,8 @@ class Main(star.Star):
                     if not caption:
                         continue
                     captions_map[image_idx] = caption
+                    message_entry["updated_at"] = time.time()
+                    registry_changed = True
                 else:
                     await self._write_shared_image_caption_cache(
                         self._image_caption_sources(
@@ -674,6 +773,9 @@ class Main(star.Star):
                     current_line,
                 )
             resolved_lines.append(current_line)
+
+        if registry_changed:
+            self._persist_image_registry(cfg)
 
         if resolved_count or failed_count:
             logger.info(
@@ -1298,31 +1400,36 @@ class Main(star.Star):
         message_id: str,
         image_urls: list[str],
         cache_sources: list[str] | None = None,
-    ) -> None:
+    ) -> bool:
         normalized_msg_id = self._normalize_message_id(message_id)
         if not normalized_msg_id or not image_urls:
-            return
+            return False
 
         self._touch_origin(origin, self._cfg())
         registry = self.runtime.image_message_registry[origin]
         message_entry = registry.get(normalized_msg_id)
+        changed = False
         if not isinstance(message_entry, dict):
             message_entry = {}
             registry[normalized_msg_id] = message_entry
+            changed = True
 
         urls = message_entry.get("urls")
         if not isinstance(urls, list):
             urls = []
             message_entry["urls"] = urls
+            changed = True
 
         stored_cache_sources = message_entry.get("cache_sources")
         if not isinstance(stored_cache_sources, list):
             stored_cache_sources = [str(url or "").strip() for url in urls]
             message_entry["cache_sources"] = stored_cache_sources
+            changed = True
 
         captions = message_entry.get("captions")
         if not isinstance(captions, dict):
             message_entry["captions"] = {}
+            changed = True
 
         existing_keys = {
             str(stored_cache_sources[idx] if idx < len(stored_cache_sources) else "")
@@ -1343,6 +1450,11 @@ class Main(star.Star):
             urls.append(clean_url or key)
             stored_cache_sources.append(cache_source or clean_url)
             existing_keys.add(key)
+            changed = True
+
+        if changed:
+            message_entry["updated_at"] = time.time()
+        return changed
 
     async def _format_adapter_history_entry(
         self, event: AstrMessageEvent, message: Any
@@ -1604,6 +1716,7 @@ class Main(star.Star):
         }
         existing_lines = set(chats)
         new_lines: list[str] = []
+        image_registry_changed = False
         for entry in entries:
             line = str(entry.get("line") or "")
             message_id = self._normalize_message_id(entry.get("message_id") or "")
@@ -1615,18 +1728,25 @@ class Main(star.Star):
             existing_lines.add(line)
             if message_id:
                 existing_ids.add(message_id)
-                self._register_history_image_sources(
-                    origin,
-                    message_id,
-                    list(entry.get("image_urls") or []),
-                    list(entry.get("cache_sources") or []),
+                image_registry_changed = (
+                    self._register_history_image_sources(
+                        origin,
+                        message_id,
+                        list(entry.get("image_urls") or []),
+                        list(entry.get("cache_sources") or []),
+                    )
+                    or image_registry_changed
                 )
 
         if not new_lines:
+            if image_registry_changed:
+                self._persist_image_registry(cfg)
             return
         chats[:0] = new_lines
         if len(chats) > cfg.group_history.max_messages:
             del chats[: len(chats) - cfg.group_history.max_messages]
+        if image_registry_changed:
+            self._persist_image_registry(cfg)
         logger.debug(
             "enhance-mode | adapter history backfilled | origin=%s added=%s size=%s",
             origin,
@@ -2038,6 +2158,22 @@ class Main(star.Star):
         return base_url
 
     @staticmethod
+    def _normalize_gemini_api_base_url(raw_base_url: str) -> str:
+        base_url = str(raw_base_url or "").strip().rstrip("/")
+        if not base_url:
+            return ""
+        if base_url.endswith("/v1") or base_url.endswith("/v1beta"):
+            return base_url
+        return f"{base_url}/v1beta"
+
+    @staticmethod
+    def _normalize_gemini_model_name(model: str) -> str:
+        clean_model = str(model or "").strip().strip("/")
+        if clean_model.startswith("models/"):
+            return clean_model[len("models/") :]
+        return clean_model
+
+    @staticmethod
     def _extract_provider_api_key(provider: Provider) -> str:
         get_current_key = getattr(provider, "get_current_key", None)
         if callable(get_current_key):
@@ -2180,6 +2316,22 @@ class Main(star.Star):
         }
 
     @staticmethod
+    def _extract_gemini_usage_tokens(data: dict[str, Any]) -> dict[str, int]:
+        usage_raw = data.get("usageMetadata")
+        if not isinstance(usage_raw, dict):
+            return {}
+        prompt_tokens = int(usage_raw.get("promptTokenCount") or 0)
+        completion_tokens = int(usage_raw.get("candidatesTokenCount") or 0)
+        total_tokens = int(
+            usage_raw.get("totalTokenCount") or (prompt_tokens + completion_tokens)
+        )
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
     def _join_base_with_path(base_url: str, path: str) -> str:
         cleaned_path = str(path or "").strip()
         if cleaned_path.startswith("http://") or cleaned_path.startswith("https://"):
@@ -2269,6 +2421,66 @@ class Main(star.Star):
             merged_text = str(data.get("output_text") or "").strip()
         return merged_text, list(source_map.values())
 
+    @staticmethod
+    def _extract_gemini_text_and_sources(
+        data: dict[str, Any],
+    ) -> tuple[str, list[dict[str, str]]]:
+        text_parts: list[str] = []
+        source_map: dict[str, dict[str, str]] = {}
+
+        def push_source(url: str, title: str = "") -> None:
+            clean_url = str(url or "").strip()
+            if not clean_url:
+                return
+            if clean_url not in source_map:
+                source_map[clean_url] = {
+                    "url": clean_url,
+                    "title": str(title or "").strip(),
+                    "snippet": "",
+                }
+                return
+            if not source_map[clean_url]["title"] and title:
+                source_map[clean_url]["title"] = str(title).strip()
+
+        candidates = data.get("candidates")
+        if not isinstance(candidates, list):
+            return "", []
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content")
+            if isinstance(content, dict):
+                parts = content.get("parts")
+                if isinstance(parts, list):
+                    for part in parts:
+                        if not isinstance(part, dict):
+                            continue
+                        text = part.get("text")
+                        if isinstance(text, str) and text.strip():
+                            text_parts.append(text)
+
+            grounding = candidate.get("groundingMetadata")
+            if not isinstance(grounding, dict):
+                continue
+            chunks = grounding.get("groundingChunks")
+            if not isinstance(chunks, list):
+                continue
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                web = chunk.get("web")
+                if not isinstance(web, dict):
+                    continue
+                push_source(
+                    url=str(web.get("uri") or web.get("url") or ""),
+                    title=str(web.get("title") or ""),
+                )
+
+        return "\n".join(part for part in text_parts if part.strip()).strip(), list(
+            source_map.values()
+        )
+
     def _build_web_search_http_requests(
         self, provider: Provider, query: str, cfg: PluginConfig
     ) -> tuple[list[dict[str, Any]], str]:
@@ -2282,10 +2494,10 @@ class Main(star.Star):
         )
 
         api_base_cfg = str(cfg.web_search.base_url_override or "").strip()
-        api_base = self._normalize_api_base_url(
-            api_base_cfg or str(provider_cfg.get("api_base") or "")
-        )
-        if not api_base:
+        raw_api_base = api_base_cfg or str(provider_cfg.get("api_base") or "")
+        api_base = self._normalize_api_base_url(raw_api_base)
+        gemini_api_base = self._normalize_gemini_api_base_url(raw_api_base)
+        if not api_base and not gemini_api_base:
             raise ValueError(
                 f"Provider `{provider_label}` missing `api_base`, cannot run web search."
             )
@@ -2299,27 +2511,75 @@ class Main(star.Star):
         model = str(provider.get_model() or provider_cfg.get("model") or "").strip()
         custom_extra_body = provider_cfg.get("custom_extra_body", {})
 
-        headers: dict[str, str] = {
+        openai_headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        gemini_headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        }
         custom_headers = provider_cfg.get("custom_headers", {})
         if isinstance(custom_headers, dict):
-            protected_headers = {"authorization", "content-type"}
             for key, value in custom_headers.items():
-                if str(key).lower() in protected_headers:
+                normalized_key = str(key).lower()
+                if normalized_key not in {"authorization", "content-type"}:
+                    openai_headers[str(key)] = str(value)
+                if normalized_key in {"content-type", "x-goog-api-key"}:
                     continue
-                headers[str(key)] = str(value)
+                gemini_headers[str(key)] = str(value)
 
         request_mode = str(cfg.web_search.request_mode or "auto").strip().lower()
         modes: list[str]
-        if request_mode in {"responses", "chat_completions"}:
+        if request_mode in {"gemini", "responses", "chat_completions"}:
             modes = [request_mode]
         else:
-            modes = ["responses", "chat_completions"]
+            modes = ["gemini", "responses", "chat_completions"]
 
         requests: list[dict[str, Any]] = []
         for mode in modes:
+            if mode == "gemini":
+                gemini_model = self._normalize_gemini_model_name(model)
+                if not gemini_model:
+                    if request_mode == "gemini":
+                        raise ValueError(
+                            f"Provider `{provider_label}` missing model, cannot run Gemini web search."
+                        )
+                    continue
+                body = {
+                    "contents": [
+                        {"role": "user", "parts": [{"text": query}]},
+                    ],
+                    "system_instruction": {
+                        "parts": [{"text": cfg.web_search.system_prompt}]
+                    },
+                    "generationConfig": {"temperature": 0.2},
+                    "tools": [{"google_search": {}}],
+                }
+                if isinstance(custom_extra_body, dict):
+                    protected_keys = {
+                        "contents",
+                        "system_instruction",
+                        "systemInstruction",
+                        "tools",
+                    }
+                    for key, value in custom_extra_body.items():
+                        if str(key) in protected_keys:
+                            continue
+                        body[str(key)] = value
+                requests.append(
+                    {
+                        "mode": "gemini",
+                        "url": self._join_base_with_path(
+                            gemini_api_base,
+                            f"/models/{gemini_model}:generateContent",
+                        ),
+                        "headers": gemini_headers,
+                        "body": body,
+                    }
+                )
+                continue
+
             if mode == "responses":
                 body = {
                     "input": query,
@@ -2340,7 +2600,7 @@ class Main(star.Star):
                     {
                         "mode": "responses",
                         "url": self._join_base_with_path(api_base, "/v1/responses"),
-                        "headers": headers,
+                        "headers": openai_headers,
                         "body": body,
                     }
                 )
@@ -2366,7 +2626,7 @@ class Main(star.Star):
                 {
                     "mode": "chat_completions",
                     "url": self._join_base_with_path(api_base, "/v1/chat/completions"),
-                    "headers": headers,
+                    "headers": openai_headers,
                     "body": body,
                 }
             )
@@ -2572,12 +2832,18 @@ class Main(star.Star):
                             }
                             continue
 
-                        usage = self._extract_usage_tokens(parsed_data)
-                        if mode == "responses":
+                        if mode == "gemini":
+                            usage = self._extract_gemini_usage_tokens(parsed_data)
+                            text, sources_from_endpoint = (
+                                self._extract_gemini_text_and_sources(parsed_data)
+                            )
+                        elif mode == "responses":
+                            usage = self._extract_usage_tokens(parsed_data)
                             text, sources_from_endpoint = (
                                 self._extract_responses_text_and_sources(parsed_data)
                             )
                         else:
+                            usage = self._extract_usage_tokens(parsed_data)
                             text = self._extract_chat_completion_text(
                                 parsed_data
                             ).strip()
@@ -3021,52 +3287,73 @@ class Main(star.Star):
             except Exception as e:
                 logger.error(f"enhance-mode | record message error: {e}")
 
-        need_active = await self._need_active_reply(event, cfg)
+        origin = event.unified_msg_origin
+        if self._has_active_reply_pending(origin):
+            logger.info(
+                "enhance-mode | active_reply skipped: pending | origin=%s",
+                origin,
+            )
+            return
+        self._mark_active_reply_pending(origin)
 
-        if need_active:
-            provider = self.context.get_using_provider(event.unified_msg_origin)
-            if not provider:
-                logger.error("enhance-mode | 未找到任何 LLM 提供商，无法主动回复")
+        try:
+            need_active = await self._need_active_reply(event, cfg)
+        except Exception as e:
+            self._clear_active_reply_pending(origin)
+            logger.error(traceback.format_exc())
+            logger.error(f"enhance-mode | 主动回复判定失败: {e}")
+            return
+
+        if not need_active:
+            self._clear_active_reply_pending(origin)
+            return
+
+        provider = self.context.get_using_provider(origin)
+        if not provider:
+            self._clear_active_reply_pending(origin)
+            logger.error("enhance-mode | 未找到任何 LLM 提供商，无法主动回复")
+            return
+        try:
+            logger.info(
+                "enhance-mode | active_reply triggered | origin=%s mode=%s provider=%s",
+                origin,
+                cfg.active_reply.mode,
+                self._provider_label(provider),
+            )
+            if hasattr(event, "set_extra"):
+                event.set_extra("_enhance_active_reply_triggered", True)
+                event.set_extra("_enhance_active_reply_mode", cfg.active_reply.mode)
+
+            active_context = await self._collect_active_reply_context(
+                event,
+                cfg,
+                backfill_target=cfg.active_reply.unified_context_messages,
+            )
+            active_prompt = self._build_active_reply_prompt(
+                cfg,
+                active_context,
+                cfg.active_reply.mode,
+            )
+            if hasattr(event, "set_extra"):
+                event.set_extra(ENHANCE_ACTIVE_REPLY_PROMPT_KEY, active_prompt)
+
+            session_curr_cid, conv = await self._ensure_active_reply_conversation(
+                event,
+                cfg,
+            )
+            if not session_curr_cid or not conv:
+                self._clear_active_reply_pending(origin)
                 return
-            try:
-                logger.info(
-                    "enhance-mode | active_reply triggered | origin=%s mode=%s provider=%s",
-                    event.unified_msg_origin,
-                    cfg.active_reply.mode,
-                    self._provider_label(provider),
-                )
-                if hasattr(event, "set_extra"):
-                    event.set_extra("_enhance_active_reply_triggered", True)
-                    event.set_extra("_enhance_active_reply_mode", cfg.active_reply.mode)
 
-                active_context = await self._collect_active_reply_context(
-                    event,
-                    cfg,
-                    backfill_target=cfg.active_reply.unified_context_messages,
-                )
-                active_prompt = self._build_active_reply_prompt(
-                    cfg,
-                    active_context,
-                    cfg.active_reply.mode,
-                )
-                if hasattr(event, "set_extra"):
-                    event.set_extra(ENHANCE_ACTIVE_REPLY_PROMPT_KEY, active_prompt)
-
-                session_curr_cid, conv = await self._ensure_active_reply_conversation(
-                    event,
-                    cfg,
-                )
-                if not session_curr_cid or not conv:
-                    return
-
-                yield event.request_llm(
-                    prompt=active_prompt,
-                    session_id=event.session_id,
-                    conversation=conv,
-                )
-            except Exception as e:
-                logger.error(traceback.format_exc())
-                logger.error(f"enhance-mode | 主动回复失败: {e}")
+            yield event.request_llm(
+                prompt=active_prompt,
+                session_id=event.session_id,
+                conversation=conv,
+            )
+        except Exception as e:
+            self._clear_active_reply_pending(origin)
+            logger.error(traceback.format_exc())
+            logger.error(f"enhance-mode | 主动回复失败: {e}")
 
     async def _record_message(self, event: AstrMessageEvent, cfg: PluginConfig) -> None:
         history_cfg = cfg.group_history
@@ -3102,13 +3389,15 @@ class Main(star.Star):
         self._touch_origin(event.unified_msg_origin, cfg)
         chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
+        image_registry_changed = False
         if len(chats) > history_cfg.max_messages:
             removed_line = chats.pop(0)
             removed_msg_id = self._extract_message_id_from_history_line(removed_line)
             if removed_msg_id:
-                self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                removed_entry = self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
+                image_registry_changed = removed_entry is not None
         if normalized_msg_id and image_urls:
             self.runtime.image_message_registry[event.unified_msg_origin][
                 normalized_msg_id
@@ -3116,7 +3405,9 @@ class Main(star.Star):
                 "urls": image_urls,
                 "cache_sources": image_cache_sources,
                 "captions": {},
+                "updated_at": time.time(),
             }
+            image_registry_changed = True
             logger.debug(
                 "enhance-mode | image message registered | origin=%s msg_id=%s image_count=%s deferred_caption=%s",
                 event.unified_msg_origin,
@@ -3124,6 +3415,8 @@ class Main(star.Star):
                 len(image_urls),
                 history_cfg.image_caption,
             )
+        if image_registry_changed:
+            self._persist_image_registry(cfg)
         logger.debug(
             "enhance-mode | group history updated | origin=%s size=%s",
             event.unified_msg_origin,
@@ -3287,13 +3580,17 @@ class Main(star.Star):
         self._touch_origin(event.unified_msg_origin, cfg)
         chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
+        image_registry_changed = False
         if len(chats) > cfg.group_history.max_messages:
             removed_line = chats.pop(0)
             removed_msg_id = self._extract_message_id_from_history_line(removed_line)
             if removed_msg_id:
-                self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                removed_entry = self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
+                image_registry_changed = removed_entry is not None
+        if image_registry_changed:
+            self._persist_image_registry(cfg)
         logger.debug(
             "enhance-mode | bot response recorded | origin=%s size=%s",
             event.unified_msg_origin,
@@ -3302,13 +3599,26 @@ class Main(star.Star):
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
+        origin = event.unified_msg_origin
+        if self._is_truthy_extra(
+            self._get_extra_value(event, "_enhance_active_reply_triggered", False)
+        ):
+            self._clear_active_reply_pending(origin)
+            logger.debug(
+                "enhance-mode | active_reply pending cleared | origin=%s",
+                origin,
+            )
+
         clean_session = event.get_extra("_clean_ltm_session", False)
         if not clean_session:
             return
-        self.runtime.cleanup_origin(event.unified_msg_origin)
+        had_image_registry = origin in self.runtime.image_message_registry
+        self.runtime.cleanup_origin(origin)
+        if had_image_registry:
+            self._persist_image_registry()
         logger.info(
             "enhance-mode | runtime session cache cleaned | origin=%s",
-            event.unified_msg_origin,
+            origin,
         )
 
     @llm_tool(name="grok_web_search")
@@ -3615,7 +3925,9 @@ class Main(star.Star):
 
         caption = ""
         caption_cached = False
-        cached_caption = captions_map.get(image_idx)
+        cached_caption = captions_map.get(image_idx) or captions_map.get(
+            str(image_idx)
+        )
         if isinstance(cached_caption, str) and cached_caption.strip():
             caption = cached_caption.strip()
             caption_cached = True
@@ -3640,6 +3952,8 @@ class Main(star.Star):
                 caption = str(caption or "").strip()
                 if caption:
                     captions_map[image_idx] = caption
+                    message_entry["updated_at"] = time.time()
+                    self._persist_image_registry(cfg)
             except Exception as e:
                 logger.exception(
                     "enhance-mode | use_image caption failed | origin=%s msg_id=%s image_index=%s error=%s",
@@ -4117,5 +4431,6 @@ class Main(star.Star):
 
     async def terminate(self) -> None:
         logger.info("enhance-mode | plugin terminating")
+        self._persist_image_registry()
         await self._stop_memory_rag_webui()
         logger.info("enhance-mode | plugin terminated")

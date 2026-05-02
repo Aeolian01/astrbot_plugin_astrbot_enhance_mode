@@ -269,7 +269,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         web_search_raw.get("system_prompt") or ""
     ).strip()
     request_mode = str(web_search_raw.get("request_mode") or "auto").strip().lower()
-    if request_mode not in {"auto", "responses", "chat_completions"}:
+    if request_mode not in {"auto", "gemini", "responses", "chat_completions"}:
         request_mode = "auto"
     web_search = WebSearchConfig(
         enable=_to_bool(web_search_raw.get("enable"), False),

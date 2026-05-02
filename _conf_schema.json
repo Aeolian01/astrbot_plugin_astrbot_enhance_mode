@@ -198,7 +198,7 @@
             },
             "request_mode": {
                 "description": "请求模式",
-                "hint": "可选: auto / responses / chat_completions。auto 会先尝试 responses，再回退 chat_completions。",
+                "hint": "可选: auto / gemini / responses / chat_completions。auto 会先尝试 gemini，再回退 responses 和 chat_completions。",
                 "type": "string",
                 "default": "auto"
             },

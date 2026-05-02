@@ -74,13 +74,16 @@ def test_web_search_request_mode_and_base_override_are_normalized() -> None:
     cfg = parse_plugin_config(
         {
             "web_search": {
-                "request_mode": "RESPONSES",
+                "request_mode": "GEMINI",
                 "base_url_override": "  https://example.com/custom/v1  ",
             }
         }
     )
-    assert cfg.web_search.request_mode == "responses"
+    assert cfg.web_search.request_mode == "gemini"
     assert cfg.web_search.base_url_override == "https://example.com/custom/v1"
+
+    cfg_responses = parse_plugin_config({"web_search": {"request_mode": "RESPONSES"}})
+    assert cfg_responses.web_search.request_mode == "responses"
 
     cfg_invalid = parse_plugin_config({"web_search": {"request_mode": "unknown"}})
     assert cfg_invalid.web_search.request_mode == "auto"

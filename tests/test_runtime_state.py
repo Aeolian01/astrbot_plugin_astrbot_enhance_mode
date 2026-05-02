@@ -8,6 +8,7 @@ def test_touch_origin_evicts_oldest_state() -> None:
 
     state.session_chats["o1"].append("m1")
     state.active_reply_stacks["o1"].append("a1")
+    state.active_reply_pending["o1"] = 123.0
     state.image_message_registry["o1"]["mid"] = {"urls": ["u1"], "captions": {}}
 
     state.touch_origin("o1", max_origins=1)
@@ -15,6 +16,7 @@ def test_touch_origin_evicts_oldest_state() -> None:
 
     assert "o1" not in state.session_chats
     assert "o1" not in state.active_reply_stacks
+    assert "o1" not in state.active_reply_pending
     assert "o1" not in state.image_message_registry
     assert list(state.origin_lru.keys()) == ["o2"]
 
@@ -23,6 +25,7 @@ def test_cleanup_origin_removes_all_runtime_state() -> None:
     state = RuntimeState()
     state.session_chats["origin"].append("msg")
     state.active_reply_stacks["origin"].append("stack")
+    state.active_reply_pending["origin"] = 123.0
     state.image_message_registry["origin"]["1"] = {"urls": ["x"], "captions": {}}
     state.touch_origin("origin", max_origins=10)
 
@@ -30,5 +33,6 @@ def test_cleanup_origin_removes_all_runtime_state() -> None:
 
     assert "origin" not in state.session_chats
     assert "origin" not in state.active_reply_stacks
+    assert "origin" not in state.active_reply_pending
     assert "origin" not in state.image_message_registry
     assert "origin" not in state.origin_lru

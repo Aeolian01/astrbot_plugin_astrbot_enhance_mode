@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from astrbot.api.platform import MessageType
@@ -35,6 +37,9 @@ class _DummyEvent:
 
     def get_extra(self, key: str, default: object = None) -> object:
         return self._extras.get(key, default)
+
+    def set_extra(self, key: str, value: object) -> None:
+        self._extras[key] = value
 
 
 class _DummyRequest:
@@ -88,6 +93,14 @@ def _build_plugin() -> Main:
     )
     plugin._cfg = lambda: cfg
     return plugin
+
+
+async def _consume_group_message(result: object) -> None:
+    if hasattr(result, "__aiter__"):
+        async for _ in result:  # type: ignore[attr-defined]
+            pass
+        return
+    await result  # type: ignore[misc]
 
 
 @pytest.mark.asyncio
@@ -166,13 +179,96 @@ async def test_group_message_with_only_face_component_is_not_skipped() -> None:
     plugin._record_message = record_message
     plugin._need_active_reply = need_active_reply
 
-    await plugin.on_group_message(event)
+    await _consume_group_message(plugin.on_group_message(event))
 
     assert called == {"record": True, "active": True}
     body, image_urls, image_cache_sources = plugin._format_event_message_body(event)
     assert body == "[QQ表情: id=462, 含义=未知]"
     assert image_urls == []
     assert image_cache_sources == []
+
+
+@pytest.mark.asyncio
+async def test_group_message_skips_active_reply_when_pending_but_records_history() -> None:
+    plugin = _build_plugin()
+    event = _DummyFaceEvent()
+    called = {"record": False, "active": False}
+    plugin.runtime.active_reply_pending[event.unified_msg_origin] = time.monotonic()
+
+    async def record_message(
+        record_event: _DummyFaceEvent,
+        _cfg: PluginConfig,
+    ) -> None:
+        called["record"] = True
+        assert record_event is event
+
+    async def need_active_reply(
+        _active_event: _DummyFaceEvent,
+        _cfg: PluginConfig,
+    ) -> bool:
+        called["active"] = True
+        raise AssertionError("_need_active_reply should not be called while pending")
+
+    plugin._record_message = record_message
+    plugin._need_active_reply = need_active_reply
+
+    await _consume_group_message(plugin.on_group_message(event))
+
+    assert called == {"record": True, "active": False}
+    assert event.unified_msg_origin in plugin.runtime.active_reply_pending
+
+
+def test_active_reply_pending_expires() -> None:
+    plugin = _build_plugin()
+    origin = "expired-origin"
+    plugin.runtime.active_reply_pending[origin] = (
+        time.monotonic() - main_module.ACTIVE_REPLY_PENDING_TTL_SEC - 1
+    )
+
+    assert plugin._has_active_reply_pending(origin) is False
+    assert origin not in plugin.runtime.active_reply_pending
+
+
+@pytest.mark.asyncio
+async def test_group_message_clears_pending_when_active_reply_not_needed() -> None:
+    plugin = _build_plugin()
+    event = _DummyFaceEvent()
+    called = {"record": False, "active": False}
+
+    async def record_message(
+        record_event: _DummyFaceEvent,
+        _cfg: PluginConfig,
+    ) -> None:
+        called["record"] = True
+        assert record_event is event
+
+    async def need_active_reply(
+        active_event: _DummyFaceEvent,
+        _cfg: PluginConfig,
+    ) -> bool:
+        called["active"] = True
+        assert active_event is event
+        return False
+
+    plugin._record_message = record_message
+    plugin._need_active_reply = need_active_reply
+
+    await _consume_group_message(plugin.on_group_message(event))
+
+    assert called == {"record": True, "active": True}
+    assert event.unified_msg_origin not in plugin.runtime.active_reply_pending
+
+
+@pytest.mark.asyncio
+async def test_after_message_sent_clears_active_reply_pending() -> None:
+    plugin = _build_plugin()
+    event = _DummyEvent()
+    event.set_extra("_enhance_active_reply_triggered", True)
+    plugin.runtime.active_reply_pending[event.unified_msg_origin] = time.monotonic()
+
+    await plugin.after_message_sent(event)
+
+    assert event.unified_msg_origin not in plugin.runtime.active_reply_pending
 
 
 def test_image_message_uses_file_as_shared_caption_cache_source(
@@ -197,3 +293,43 @@ def test_image_message_uses_file_as_shared_caption_cache_source(
     assert body == "[Image]"
     assert image_urls == ["https://example.com/download?id=abc"]
     assert image_cache_sources == ["D486F2DB1F7B6087234AC5C1050723C6.png"]
+
+
+def test_image_caption_sources_include_fileid_and_normalized_url() -> None:
+    sources = Main._image_caption_sources(
+        "https://example.com/get_image?fileid=abc&rkey=temp&token=secret&size=large",
+        "D486F2DB1F7B6087234AC5C1050723C6.png",
+    )
+
+    assert sources == [
+        "D486F2DB1F7B6087234AC5C1050723C6.png",
+        "https://example.com/get_image?fileid=abc&rkey=temp&token=secret&size=large",
+        "fileid:abc",
+        "https://example.com/get_image?fileid=abc&size=large",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shared_caption_cache_hit_is_written_to_all_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    sources = Main._image_caption_sources(
+        "https://example.com/get_image?fileid=abc&rkey=temp",
+        "image.png",
+    )
+    writes: list[tuple[str, str]] = []
+
+    async def get_cached(source: str) -> str:
+        return "缓存图片描述" if source == "fileid:abc" else ""
+
+    async def set_cached(source: str, caption: str) -> None:
+        writes.append((source, caption))
+
+    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached)
+    monkeypatch.setattr(main_module, "forward_set_cached_image_caption", set_cached)
+
+    caption = await plugin._read_shared_image_caption_cache(sources)
+
+    assert caption == "缓存图片描述"
+    assert writes == [(source, "缓存图片描述") for source in sources]
