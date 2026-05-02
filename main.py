@@ -3082,7 +3082,24 @@ class Main(star.Star):
             )
             return
 
-        passive_context = await self._collect_active_reply_context(event, cfg)
+        current_message_text, current_message_source = (
+            await self._resolve_active_current_message_text(event, cfg)
+        )
+        request_prompt = str(getattr(req, "prompt", "") or "").strip()
+        if (
+            current_message_source == "empty"
+            and request_prompt
+            and request_prompt != "[Empty]"
+        ):
+            current_message_text = request_prompt
+            current_message_source = "provider_request.prompt"
+
+        passive_context = await self._collect_active_reply_context(
+            event,
+            cfg,
+            current_message_text=current_message_text,
+            current_message_source=current_message_source,
+        )
         req.prompt = self._build_active_reply_prompt(
             cfg,
             passive_context,
