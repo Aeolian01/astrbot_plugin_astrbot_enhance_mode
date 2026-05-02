@@ -619,32 +619,34 @@ class Main(star.Star):
                 return cached_after_wait
 
             final_prompt = str(prompt or "").strip() or cfg.group_history.image_caption_prompt
-            caption = ""
-            if FORWARD_CONTEXT_AVAILABLE:
-                try:
-                    caption = await forward_get_or_create_image_caption(
-                        event,
-                        clean_image_url,
-                        cache_source=cache_source,
-                        extra_sources=sources,
-                        provider_id=cfg.group_history.image_caption_provider_id,
-                        prompt=final_prompt,
-                        timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "enhance-mode | forward-context image caption create failed | error=%s",
-                        e,
-                    )
-                    caption = ""
-            if not caption:
-                caption = await self._get_image_caption(
-                    image_url=clean_image_url,
+            if not FORWARD_CONTEXT_AVAILABLE:
+                logger.debug(
+                    "enhance-mode | forward-context unavailable; skip local image caption | image_url=%s",
+                    clean_image_url,
+                )
+                return ""
+            try:
+                caption = await forward_get_or_create_image_caption(
+                    event,
+                    clean_image_url,
+                    cache_source=cache_source,
+                    extra_sources=sources,
                     provider_id=cfg.group_history.image_caption_provider_id,
                     prompt=final_prompt,
                     timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
                 )
+            except Exception as e:
+                logger.debug(
+                    "enhance-mode | forward-context image caption create failed; skip local fallback | error=%s",
+                    e,
+                )
+                return ""
             caption = str(caption or "").strip()
+            if not caption:
+                logger.debug(
+                    "enhance-mode | forward-context image caption empty; skip local fallback | sources=%s",
+                    sources,
+                )
             return caption
 
         task = asyncio.create_task(caption_task())
