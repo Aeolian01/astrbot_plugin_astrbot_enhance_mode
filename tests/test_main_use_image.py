@@ -115,6 +115,52 @@ def test_forward_context_api_retries_after_initial_import_failure(
     assert calls["count"] == 2
 
 
+def test_forward_context_api_uses_loaded_public_api_when_import_path_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build_image_caption_sources(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return []
+
+    async def get_cached_image_caption(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    async def get_cached_image_message(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return {}
+
+    async def get_or_create_image_caption(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    async def parse_history_message(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    loaded_module = types.SimpleNamespace(
+        __file__="/opt/astrbot/plugins/astrbot_plugin_forward_context/public_api.py",
+        build_image_caption_sources=build_image_caption_sources,
+        get_cached_image_caption=get_cached_image_caption,
+        get_cached_image_message=get_cached_image_message,
+        get_or_create_image_caption=get_or_create_image_caption,
+        parse_history_message=parse_history_message,
+    )
+
+    def import_module(name: str) -> object:
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API", None)
+    monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT", 0.0)
+    monkeypatch.setattr(main_module.importlib, "import_module", import_module)
+    monkeypatch.setitem(
+        main_module.sys.modules,
+        "astrbot.core.plugins.local.forward_context.public_api",
+        loaded_module,
+    )
+
+    api = main_module._get_forward_context_api()
+
+    assert api is not None
+    assert api["get_cached_image_caption"] is get_cached_image_caption
+    assert main_module._get_forward_context_api() is api
+
+
 @pytest.mark.asyncio
 async def test_use_image_attach_only_works_without_caption_enabled() -> None:
     plugin, event = _build_plugin(image_caption=False)

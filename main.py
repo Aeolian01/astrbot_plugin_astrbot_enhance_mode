@@ -6,6 +6,7 @@ import json
 import mimetypes
 import random
 import re
+import sys
 import time
 import traceback
 import uuid
@@ -98,25 +99,65 @@ def _log_forward_context_api_unavailable(error: object) -> None:
     )
 
 
+def _module_looks_like_forward_context(module_name: str, module: object) -> bool:
+    normalized_name = str(module_name or "").replace("\\", "/")
+    if (
+        normalized_name == "astrbot_plugin_forward_context"
+        or normalized_name.endswith(".astrbot_plugin_forward_context")
+        or ".astrbot_plugin_forward_context." in normalized_name
+        or normalized_name.startswith("astrbot_plugin_forward_context.")
+    ):
+        return True
+
+    module_file = str(getattr(module, "__file__", "") or "").replace("\\", "/")
+    return "/astrbot_plugin_forward_context/" in module_file
+
+
+def _api_from_forward_context_module(module: object) -> dict[str, Any] | None:
+    if any(not hasattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS):
+        return None
+    return {attr: getattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS}
+
+
+def _find_loaded_forward_context_api() -> dict[str, Any] | None:
+    for module_name, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        if not _module_looks_like_forward_context(module_name, module):
+            continue
+        api = _api_from_forward_context_module(module)
+        if api is not None:
+            logger.debug(
+                "enhance-mode | forward-context API resolved from loaded module | module=%s",
+                module_name,
+            )
+            return api
+    return None
+
+
 def _get_forward_context_api() -> dict[str, Any] | None:
     global _FORWARD_CONTEXT_API
 
     if _FORWARD_CONTEXT_API is not None:
         return _FORWARD_CONTEXT_API
 
+    loaded_api = _find_loaded_forward_context_api()
+    if loaded_api is not None:
+        _FORWARD_CONTEXT_API = loaded_api
+        return _FORWARD_CONTEXT_API
+
     try:
         module = importlib.import_module("astrbot_plugin_forward_context")
-        missing = [
-            attr for attr in FORWARD_CONTEXT_API_ATTRS if not hasattr(module, attr)
-        ]
-        if missing:
+        api = _api_from_forward_context_module(module)
+        if api is None:
+            missing = [
+                attr for attr in FORWARD_CONTEXT_API_ATTRS if not hasattr(module, attr)
+            ]
             raise AttributeError(
                 "astrbot_plugin_forward_context missing public API: "
                 + ", ".join(missing)
             )
-        _FORWARD_CONTEXT_API = {
-            attr: getattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS
-        }
+        _FORWARD_CONTEXT_API = api
         logger.debug("enhance-mode | forward-context API resolved")
         return _FORWARD_CONTEXT_API
     except Exception as e:
