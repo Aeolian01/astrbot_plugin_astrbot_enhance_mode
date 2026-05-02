@@ -2767,7 +2767,11 @@ class Main(star.Star):
 
         try:
             timeout = aiohttp.ClientTimeout(total=cfg.web_search.timeout_sec)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            proxy_url = str(cfg.web_search.proxy_url or "").strip() or None
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                trust_env=True,
+            ) as session:
                 for request_spec in request_specs:
                     mode = str(request_spec.get("mode") or "chat_completions")
                     request_url = str(request_spec.get("url") or "")
@@ -2777,17 +2781,19 @@ class Main(star.Star):
                         continue
 
                     logger.info(
-                        "enhance-mode | web_search request | origin=%s provider=%s mode=%s url=%s",
+                        "enhance-mode | web_search request | origin=%s provider=%s mode=%s url=%s proxy=%s",
                         event.unified_msg_origin,
                         provider_label,
                         mode,
                         request_url,
+                        proxy_url or "<none>",
                     )
 
                     async with session.post(
                         request_url,
                         json=body,
                         headers=headers,
+                        proxy=proxy_url,
                     ) as resp:
                         raw_text = await resp.text()
                         if resp.status != 200:
