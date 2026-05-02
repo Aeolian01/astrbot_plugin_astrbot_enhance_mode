@@ -1831,10 +1831,9 @@ class Main(star.Star):
                     [current_line],
                 )
                 resolved_line = resolved_lines[0] if resolved_lines else current_line
-                current_body = self._extract_history_line_body(resolved_line)
-                if current_body:
+                if resolved_line:
                     return (
-                        self._truncate_active_message_text(current_body),
+                        self._truncate_active_message_text(resolved_line),
                         "session_chats",
                     )
 
