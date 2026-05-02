@@ -251,8 +251,57 @@ class Main(star.Star):
                 parts.append(" [Image]")
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
+            else:
+                fallback = self._format_unknown_message_component(comp)
+                if fallback:
+                    parts.append(fallback)
 
         return "".join(parts).strip(), image_urls, image_cache_sources
+
+    @staticmethod
+    def _format_unknown_message_component(comp: Any) -> str:
+        comp_name = type(comp).__name__
+        normalized_name = comp_name.strip().lower()
+        if normalized_name in {"face", "emoji", "mface"}:
+            face_id = ""
+            for attr in ("id", "face_id", "emoji_id"):
+                face_id = str(getattr(comp, attr, "") or "").strip()
+                if face_id:
+                    break
+
+            meaning = ""
+            for attr in ("summary", "name", "text", "emoji_name"):
+                meaning = str(getattr(comp, attr, "") or "").strip()
+                if meaning:
+                    break
+
+            id_part = face_id or "未知"
+            meaning_part = meaning or "未知"
+            return f" [QQ表情: id={id_part}, 含义={meaning_part}]"
+
+        labels = {
+            "record": "语音消息",
+            "video": "视频消息",
+            "file": "文件",
+            "json": "JSON消息",
+            "xml": "XML消息",
+            "location": "位置消息",
+            "share": "分享消息",
+            "dice": "骰子",
+            "rps": "猜拳",
+            "poke": "戳一戳",
+            "forward": "转发消息",
+        }
+        label = labels.get(normalized_name)
+        if not label:
+            return ""
+
+        for attr in ("id", "face_id", "emoji_id", "name", "text", "file", "url"):
+            value = getattr(comp, attr, None)
+            clean = str(value or "").strip()
+            if clean:
+                return f" [{label}: {clean}]"
+        return f" [{label}]"
 
     async def _build_active_message_text(
         self, event: AstrMessageEvent, cfg: PluginConfig
@@ -2922,10 +2971,8 @@ class Main(star.Star):
             return
 
         forward_context_text = self._get_forward_context_text(event)
-        has_content = any(
-            isinstance(comp, (Plain, Image, Reply))
-            for comp in event.message_obj.message
-        )
+        event_body, _, _ = self._format_event_message_body(event)
+        has_content = bool(event_body)
         if not has_content and not forward_context_text:
             return
 

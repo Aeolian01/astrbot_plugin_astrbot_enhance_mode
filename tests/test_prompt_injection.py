@@ -42,6 +42,35 @@ class _DummyRequest:
         self.contexts: list[object] = ["old-context"]
 
 
+class _DummyFace:
+    id = 462
+
+
+class _DummyFaceMessageObj:
+    message_id = "face-1"
+    message = [_DummyFace()]
+
+    class Sender:
+        nickname = "Alice"
+
+    sender = Sender()
+
+
+class _DummyFaceEvent:
+    unified_msg_origin = "origin-face"
+    message_obj = _DummyFaceMessageObj()
+    message_str = ""
+
+    def get_message_type(self) -> MessageType:
+        return MessageType.GROUP_MESSAGE
+
+    def get_messages(self) -> list[object]:
+        return self.message_obj.message
+
+    def get_sender_id(self) -> str:
+        return "10001"
+
+
 def _build_plugin() -> Main:
     plugin = Main.__new__(Main)
     plugin.runtime = RuntimeState()
@@ -104,3 +133,36 @@ async def test_passive_injection_backfills_history_for_empty_plugin_event() -> N
     assert "刚才大家在聊午饭" in req.prompt
     assert "有没有人想喝奶茶" in req.prompt
     assert "(no recent group chat history)" not in req.prompt
+
+
+@pytest.mark.asyncio
+async def test_group_message_with_only_face_component_is_not_skipped() -> None:
+    plugin = _build_plugin()
+    event = _DummyFaceEvent()
+    called = {"record": False, "active": False}
+
+    async def record_message(
+        record_event: _DummyFaceEvent,
+        _cfg: PluginConfig,
+    ) -> None:
+        called["record"] = True
+        assert record_event is event
+
+    async def need_active_reply(
+        active_event: _DummyFaceEvent,
+        _cfg: PluginConfig,
+    ) -> bool:
+        called["active"] = True
+        assert active_event is event
+        return False
+
+    plugin._record_message = record_message
+    plugin._need_active_reply = need_active_reply
+
+    await plugin.on_group_message(event)
+
+    assert called == {"record": True, "active": True}
+    body, image_urls, image_cache_sources = plugin._format_event_message_body(event)
+    assert body == "[QQ表情: id=462, 含义=未知]"
+    assert image_urls == []
+    assert image_cache_sources == []
