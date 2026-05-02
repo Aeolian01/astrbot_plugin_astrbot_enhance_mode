@@ -22,6 +22,7 @@ def test_parse_plugin_config_defaults() -> None:
     assert cfg.active_reply_enabled is False
     assert cfg.web_search.request_mode == "auto"
     assert cfg.web_search.base_url_override == ""
+    assert cfg.web_search.proxy_url == ""
 
 
 def test_probability_is_clamped_and_nan_falls_back() -> None:
@@ -76,11 +77,13 @@ def test_web_search_request_mode_and_base_override_are_normalized() -> None:
             "web_search": {
                 "request_mode": "GEMINI",
                 "base_url_override": "  https://example.com/custom/v1  ",
+                "proxy_url": "  http://sing-box:7890  ",
             }
         }
     )
     assert cfg.web_search.request_mode == "gemini"
     assert cfg.web_search.base_url_override == "https://example.com/custom/v1"
+    assert cfg.web_search.proxy_url == "http://sing-box:7890"
 
     cfg_responses = parse_plugin_config({"web_search": {"request_mode": "RESPONSES"}})
     assert cfg_responses.web_search.request_mode == "responses"
