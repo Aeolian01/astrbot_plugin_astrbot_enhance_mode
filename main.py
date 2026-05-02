@@ -305,6 +305,35 @@ class Main(star.Star):
                 return f" [{label}: {clean}]"
         return f" [{label}]"
 
+    @staticmethod
+    def _is_action_only_text(text: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(text or "").strip())
+        if not normalized:
+            return False
+        return bool(
+            re.fullmatch(r"\[戳一戳(?::[^\]]*)?\]", normalized)
+            or re.fullmatch(
+                r"\[(?:poke|nudge)(?::[^\]]*)?\]", normalized, re.IGNORECASE
+            )
+        )
+
+    def _is_action_only_event(
+        self, event: AstrMessageEvent, event_body: str = ""
+    ) -> bool:
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return False
+
+        if self._is_action_only_text(event_body):
+            return True
+
+        message_chain = list(event.get_messages() or [])
+        if not message_chain:
+            return False
+
+        return all(
+            type(comp).__name__.strip().lower() == "poke" for comp in message_chain
+        )
+
     async def _build_active_message_text(
         self, event: AstrMessageEvent, cfg: PluginConfig
     ) -> str:
@@ -2976,6 +3005,14 @@ class Main(star.Star):
         event_body, _, _ = self._format_event_message_body(event)
         has_content = bool(event_body)
         if not has_content and not forward_context_text:
+            return
+
+        if self._is_action_only_event(event, event_body):
+            logger.info(
+                "enhance-mode | skip action-only event | origin=%s body=%s",
+                event.unified_msg_origin,
+                event_body,
+            )
             return
 
         if self._history_recording_enabled(cfg):
