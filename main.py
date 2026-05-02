@@ -247,8 +247,9 @@ class Main(star.Star):
                 parts.append(f" {comp.text}")
             elif isinstance(comp, Image):
                 image_url = str(comp.url or comp.file or "").strip()
+                image_cache_source = str(comp.file or comp.url or "").strip()
                 image_urls.append(image_url)
-                image_cache_sources.append(image_url)
+                image_cache_sources.append(image_cache_source or image_url)
                 parts.append(" [Image]")
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
