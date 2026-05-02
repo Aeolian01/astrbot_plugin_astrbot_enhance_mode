@@ -310,7 +310,7 @@ def test_image_caption_sources_include_fileid_and_normalized_url() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shared_caption_cache_hit_is_written_to_all_aliases(
+async def test_shared_caption_cache_reads_alias_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = _build_plugin()
@@ -318,18 +318,13 @@ async def test_shared_caption_cache_hit_is_written_to_all_aliases(
         "https://example.com/get_image?fileid=abc&rkey=temp",
         "image.png",
     )
-    writes: list[tuple[str, str]] = []
 
-    async def get_cached(source: str) -> str:
-        return "缓存图片描述" if source == "fileid:abc" else ""
-
-    async def set_cached(source: str, caption: str) -> None:
-        writes.append((source, caption))
+    async def get_cached(source_or_sources: object) -> str:
+        assert source_or_sources == sources
+        return "缓存图片描述"
 
     monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached)
-    monkeypatch.setattr(main_module, "forward_set_cached_image_caption", set_cached)
 
     caption = await plugin._read_shared_image_caption_cache(sources)
 
     assert caption == "缓存图片描述"
-    assert writes == [(source, "缓存图片描述") for source in sources]

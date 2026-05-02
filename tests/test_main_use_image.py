@@ -5,10 +5,8 @@ import json
 from mcp import types as mcp_types
 import pytest
 
+import astrbot_plugin_astrbot_enhance_mode.main as main_module
 from astrbot_plugin_astrbot_enhance_mode.main import Main
-from astrbot_plugin_astrbot_enhance_mode.image_registry_store import (
-    ImageMessageRegistryStore,
-)
 from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     GlobalSettingsConfig,
     GroupFeatureEnhancementConfig,
@@ -85,28 +83,29 @@ async def test_use_image_attach_only_works_without_caption_enabled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_use_image_can_use_registry_restored_from_json(tmp_path) -> None:
-    store = ImageMessageRegistryStore(tmp_path / "image_message_registry.json")
-    store.save(
-        {
-            "origin-1": {
-                "123": {
-                    "urls": ["https://example.com/restored.png"],
-                    "cache_sources": ["fileid:restored"],
-                    "captions": {},
-                    "updated_at": 1000,
-                }
-            }
-        },
-        max_messages_per_origin=10,
-        max_origins=10,
-    )
+async def test_use_image_can_use_forward_context_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plugin, event = _build_plugin(image_caption=False)
-    plugin.runtime.image_message_registry.update(store.load())
+
+    async def get_cached_image_message(origin: str, message_id: str) -> dict[str, object]:
+        assert origin == "origin-1"
+        assert message_id == "123"
+        return {
+            "urls": ["https://example.com/restored.png"],
+            "cache_sources": ["fileid:restored"],
+            "captions": {},
+            "updated_at": 1000,
+        }
 
     async def resolve_local_path(_image_ref: str) -> str:
         return "/tmp/restored-image.png"
 
+    monkeypatch.setattr(
+        main_module,
+        "forward_get_cached_image_message",
+        get_cached_image_message,
+    )
     plugin._resolve_image_ref_to_local_path = resolve_local_path
     plugin._encode_image_file = lambda _path: ("cmVzdG9yZWQ=", "image/png")
 
@@ -125,6 +124,9 @@ async def test_use_image_can_use_registry_restored_from_json(tmp_path) -> None:
     payload = _payload_from_results(results)
     assert payload["success"] is True
     assert payload["attach_success"] is True
+    assert plugin.runtime.image_message_registry["origin-1"]["123"]["urls"] == [
+        "https://example.com/restored.png"
+    ]
 
 
 @pytest.mark.asyncio
@@ -173,22 +175,38 @@ async def test_use_image_default_mode_attaches_and_writes_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_use_image_persists_generated_caption(tmp_path) -> None:
+async def test_use_image_delegates_caption_creation_to_forward_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plugin, event = _build_plugin(image_caption=True)
-    plugin.image_registry_store = ImageMessageRegistryStore(
-        tmp_path / "image_message_registry.json"
+    called: dict[str, object] = {}
+
+    async def get_cached_caption(_sources: object) -> str:
+        return ""
+
+    async def get_or_create_caption(event_arg, image_url: str, **kwargs):  # noqa: ANN001, ANN003
+        called["event"] = event_arg
+        called["image_url"] = image_url
+        called.update(kwargs)
+        return "Forward caption"
+
+    async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("_get_image_caption should not be called after forward hit")
+
+    monkeypatch.setattr(main_module, "FORWARD_CONTEXT_AVAILABLE", True)
+    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached_caption)
+    monkeypatch.setattr(
+        main_module,
+        "forward_get_or_create_image_caption",
+        get_or_create_caption,
     )
 
-    async def get_image_caption(*args, **kwargs):  # noqa: ANN002, ANN003
-        return "Persisted caption"
-
-    plugin._get_image_caption = get_image_caption
+    plugin._get_image_caption = should_not_be_called
     plugin._apply_image_caption_to_history = lambda **_kwargs: True
     plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
         "urls": ["https://example.com/image.png"],
-        "cache_sources": ["fileid:persisted"],
+        "cache_sources": ["fileid:delegated"],
         "captions": {},
-        "updated_at": 1000,
     }
 
     results = []
@@ -202,8 +220,13 @@ async def test_use_image_persists_generated_caption(tmp_path) -> None:
         results.append(item)
 
     assert _payload_from_results(results)["success"] is True
-    restored = plugin.image_registry_store.load()
-    assert restored["origin-1"]["123"]["captions"]["0"] == "Persisted caption"
+    assert called["event"] is event
+    assert called["image_url"] == "https://example.com/image.png"
+    assert called["cache_source"] == "fileid:delegated"
+    assert (
+        plugin.runtime.image_message_registry[event.unified_msg_origin]["123"]["captions"][0]
+        == "Forward caption"
+    )
 
 
 @pytest.mark.asyncio

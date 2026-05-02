@@ -11,7 +11,6 @@ import uuid
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -30,23 +29,55 @@ from astrbot.core.utils.io import download_image_by_url
 
 try:
     from astrbot_plugin_forward_context import (
+        build_image_caption_sources as forward_build_image_caption_sources,
         get_cached_image_caption as forward_get_cached_image_caption,
+        get_cached_image_message as forward_get_cached_image_message,
+        get_or_create_image_caption as forward_get_or_create_image_caption,
         parse_history_message as forward_parse_history_message,
-        set_cached_image_caption as forward_set_cached_image_caption,
     )
+    FORWARD_CONTEXT_AVAILABLE = True
 except Exception:
+    FORWARD_CONTEXT_AVAILABLE = False
 
-    async def forward_get_cached_image_caption(source: str) -> str:
+    def forward_build_image_caption_sources(
+        image_url: str = "",
+        cache_source: str = "",
+        extra_sources: Any = None,
+    ) -> list[str]:
+        sources: list[str] = []
+        for source in (cache_source, image_url):
+            clean = str(source or "").strip()
+            if clean and clean not in sources:
+                sources.append(clean)
+        if isinstance(extra_sources, (list, tuple, set)):
+            for source in extra_sources:
+                clean = str(source or "").strip()
+                if clean and clean not in sources:
+                    sources.append(clean)
+        return sources
+
+    async def forward_get_cached_image_caption(source: Any) -> str:
+        return ""
+
+    async def forward_get_cached_image_message(origin: str, message_id: str) -> dict:
+        return {}
+
+    async def forward_get_or_create_image_caption(
+        event: Any,
+        image_url: str,
+        *,
+        cache_source: str = "",
+        extra_sources: Any = None,
+        provider_id: str = "",
+        prompt: str = "",
+        timeout_sec: float | None = None,
+    ) -> str:
         return ""
 
     async def forward_parse_history_message(event: Any, message: Any) -> str:
         return ""
 
-    async def forward_set_cached_image_caption(source: str, caption: str) -> None:
-        return None
-
 from .ban_control import BanStore, parse_duration_seconds
-from .image_registry_store import ImageMessageRegistryStore
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
 from .runtime_state import RuntimeState
@@ -63,7 +94,6 @@ from .webui import RAGWebUIServer
 
 IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
 MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
-IMAGE_SOURCE_VOLATILE_QUERY_KEYS = {"rkey", "ukey", "token", "sig", "sign"}
 FORWARD_CONTEXT_TEXT_KEY = "_forward_context_text"
 FORWARD_CONTEXT_FOUND_KEY = "_forward_context_found"
 FORWARD_CONTEXT_IDS_KEY = "_forward_context_ids"
@@ -85,12 +115,6 @@ class Main(star.Star):
             / "plugin_data"
             / "astrbot_plugin_astrbot_enhance_mode"
         )
-        self.image_registry_store = ImageMessageRegistryStore(
-            plugin_data_dir / "image_message_registry.json"
-        )
-        loaded_image_registry = self.image_registry_store.load()
-        if loaded_image_registry:
-            self.runtime.image_message_registry.update(loaded_image_registry)
         self.ban_store = BanStore(plugin_data_dir / "ban_list.db")
         self.memory_rag_store: MemoryRAGStore | None = None
         self.rag_webui_server: RAGWebUIServer | None = None
@@ -102,39 +126,17 @@ class Main(star.Star):
         except Exception as e:
             logger.error(f"enhance-mode | 初始化记忆 RAG 存储失败: {e}", exc_info=True)
         logger.info(
-            "enhance-mode | plugin initialized | data_dir=%s memory_rag_store_ready=%s timezone=%s image_registry_origins=%s",
+            "enhance-mode | plugin initialized | data_dir=%s memory_rag_store_ready=%s timezone=%s",
             plugin_data_dir,
             self.memory_rag_store is not None,
             self._display_timezone,
-            len(loaded_image_registry),
         )
 
     def _cfg(self) -> PluginConfig:
         return parse_plugin_config(self.config)
 
     def _touch_origin(self, origin: str, cfg: PluginConfig) -> None:
-        image_origins_before = set(self.runtime.image_message_registry.keys())
         self.runtime.touch_origin(origin, cfg.global_settings.lru_cache.max_origins)
-        if image_origins_before != set(self.runtime.image_message_registry.keys()):
-            self._persist_image_registry(cfg)
-
-    def _persist_image_registry(self, cfg: PluginConfig | None = None) -> None:
-        store = getattr(self, "image_registry_store", None)
-        if store is None:
-            return
-        if cfg is None:
-            cfg = self._cfg()
-        try:
-            store.save(
-                self.runtime.image_message_registry,
-                max_messages_per_origin=cfg.group_history.max_messages * 3,
-                max_origins=cfg.global_settings.lru_cache.max_origins,
-            )
-        except Exception as e:
-            logger.debug(
-                "enhance-mode | image registry persist failed | error=%s",
-                e,
-            )
 
     @staticmethod
     def _get_extra_value(
@@ -521,47 +523,11 @@ class Main(star.Star):
         return False
 
     @staticmethod
-    def _image_source_url_aliases(source: str) -> list[str]:
-        clean = str(source or "").strip()
-        if not clean.startswith(("http://", "https://")):
-            return []
-        try:
-            parsed = urlparse(clean)
-            qs = parse_qs(parsed.query, keep_blank_values=True)
-            aliases: list[str] = []
-            fileid = str(qs.get("fileid", [""])[0] or "").strip()
-            if fileid:
-                aliases.append(f"fileid:{fileid}")
-            for volatile_key in IMAGE_SOURCE_VOLATILE_QUERY_KEYS:
-                qs.pop(volatile_key, None)
-            normalized_query = urlencode(qs, doseq=True)
-            normalized_url = urlunparse(
-                (
-                    parsed.scheme,
-                    parsed.netloc,
-                    parsed.path,
-                    parsed.params,
-                    normalized_query,
-                    "",
-                )
-            )
-            if normalized_url and normalized_url != clean:
-                aliases.append(normalized_url)
-            return aliases
-        except Exception:
-            return []
-
-    @classmethod
-    def _image_caption_sources(cls, image_url: str, cache_source: str = "") -> list[str]:
-        sources: list[str] = []
-        for candidate in (cache_source, image_url):
-            clean = str(candidate or "").strip()
-            if clean and clean not in sources:
-                sources.append(clean)
-            for alias in cls._image_source_url_aliases(clean):
-                if alias and alias not in sources:
-                    sources.append(alias)
-        return sources
+    def _image_caption_sources(image_url: str, cache_source: str = "") -> list[str]:
+        return forward_build_image_caption_sources(
+            image_url=image_url,
+            cache_source=cache_source,
+        )
 
     @staticmethod
     def _is_captionable_image_ref(image_ref: str) -> bool:
@@ -576,41 +542,51 @@ class Main(star.Star):
             return False
 
     async def _read_shared_image_caption_cache(self, sources: list[str]) -> str:
-        for source in sources:
-            try:
-                caption = await forward_get_cached_image_caption(source)
-            except Exception as e:
-                logger.debug(
-                    "enhance-mode | shared image caption cache read failed | source=%s error=%s",
-                    source,
-                    e,
-                )
-                continue
-            caption = str(caption or "").strip()
-            if caption:
-                logger.debug(
-                    "enhance-mode | shared image caption cache hit | source=%s",
-                    source,
-                )
-                await self._write_shared_image_caption_cache(sources, caption)
-                return caption
+        try:
+            caption = await forward_get_cached_image_caption(sources)
+        except Exception as e:
+            logger.debug(
+                "enhance-mode | shared image caption cache read failed | sources=%s error=%s",
+                sources,
+                e,
+            )
+            return ""
+        caption = str(caption or "").strip()
+        if caption:
+            logger.debug(
+                "enhance-mode | shared image caption cache hit | sources=%s",
+                sources,
+            )
+            return caption
         return ""
 
-    async def _write_shared_image_caption_cache(
-        self, sources: list[str], caption: str
-    ) -> None:
-        clean_caption = str(caption or "").strip()
-        if not clean_caption:
-            return
-        for source in sources:
-            try:
-                await forward_set_cached_image_caption(source, clean_caption)
-            except Exception as e:
-                logger.debug(
-                    "enhance-mode | shared image caption cache write failed | source=%s error=%s",
-                    source,
-                    e,
-                )
+    async def _get_image_message_entry(
+        self, origin: str, message_id: str
+    ) -> dict[str, Any]:
+        normalized_msg_id = self._normalize_message_id(message_id)
+        if not origin or not normalized_msg_id:
+            return {}
+        local_entry = self.runtime.image_message_registry.get(origin, {}).get(
+            normalized_msg_id
+        )
+        if isinstance(local_entry, dict):
+            local_urls = local_entry.get("urls")
+            if isinstance(local_urls, list) and local_urls:
+                return local_entry
+        try:
+            entry = await forward_get_cached_image_message(origin, normalized_msg_id)
+        except Exception as e:
+            logger.debug(
+                "enhance-mode | forward image message read failed | origin=%s msg_id=%s error=%s",
+                origin,
+                normalized_msg_id,
+                e,
+            )
+            return {}
+        if isinstance(entry, dict) and isinstance(entry.get("urls"), list):
+            self.runtime.image_message_registry[origin][normalized_msg_id] = entry
+            return entry
+        return local_entry if isinstance(local_entry, dict) else {}
 
     async def _caption_image_with_cache(
         self,
@@ -643,15 +619,32 @@ class Main(star.Star):
                 return cached_after_wait
 
             final_prompt = str(prompt or "").strip() or cfg.group_history.image_caption_prompt
-            caption = await self._get_image_caption(
-                image_url=clean_image_url,
-                provider_id=cfg.group_history.image_caption_provider_id,
-                prompt=final_prompt,
-                timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
-            )
+            caption = ""
+            if FORWARD_CONTEXT_AVAILABLE:
+                try:
+                    caption = await forward_get_or_create_image_caption(
+                        event,
+                        clean_image_url,
+                        cache_source=cache_source,
+                        extra_sources=sources,
+                        provider_id=cfg.group_history.image_caption_provider_id,
+                        prompt=final_prompt,
+                        timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "enhance-mode | forward-context image caption create failed | error=%s",
+                        e,
+                    )
+                    caption = ""
+            if not caption:
+                caption = await self._get_image_caption(
+                    image_url=clean_image_url,
+                    provider_id=cfg.group_history.image_caption_provider_id,
+                    prompt=final_prompt,
+                    timeout_sec=cfg.global_settings.timeouts.image_caption_sec,
+                )
             caption = str(caption or "").strip()
-            if caption:
-                await self._write_shared_image_caption_cache(sources, caption)
             return caption
 
         task = asyncio.create_task(caption_task())
@@ -672,18 +665,18 @@ class Main(star.Star):
             return lines
 
         origin = event.unified_msg_origin
-        message_registry = self.runtime.image_message_registry.get(origin, {})
-        if not message_registry:
-            return lines
 
         resolved_lines: list[str] = []
         resolved_count = 0
         failed_count = 0
-        registry_changed = False
         for line in lines:
             current_line = line
             message_id = self._extract_message_id_from_history_line(line)
-            message_entry = message_registry.get(message_id) if message_id else None
+            message_entry = (
+                await self._get_image_message_entry(origin, message_id)
+                if message_id
+                else {}
+            )
             if not isinstance(message_entry, dict):
                 resolved_lines.append(current_line)
                 continue
@@ -746,16 +739,6 @@ class Main(star.Star):
                     if not caption:
                         continue
                     captions_map[image_idx] = caption
-                    message_entry["updated_at"] = time.time()
-                    registry_changed = True
-                else:
-                    await self._write_shared_image_caption_cache(
-                        self._image_caption_sources(
-                            str(urls_raw[image_idx] or "").strip(),
-                            cache_source,
-                        ),
-                        caption,
-                    )
 
                 replaced_line, changed = self._replace_image_marker_at_index(
                     current_line,
@@ -773,9 +756,6 @@ class Main(star.Star):
                     current_line,
                 )
             resolved_lines.append(current_line)
-
-        if registry_changed:
-            self._persist_image_registry(cfg)
 
         if resolved_count or failed_count:
             logger.info(
@@ -1409,7 +1389,7 @@ class Main(star.Star):
         registry = self.runtime.image_message_registry[origin]
         message_entry = registry.get(normalized_msg_id)
         changed = False
-        if not isinstance(message_entry, dict):
+        if not isinstance(message_entry, dict) or not message_entry:
             message_entry = {}
             registry[normalized_msg_id] = message_entry
             changed = True
@@ -1452,8 +1432,6 @@ class Main(star.Star):
             existing_keys.add(key)
             changed = True
 
-        if changed:
-            message_entry["updated_at"] = time.time()
         return changed
 
     async def _format_adapter_history_entry(
@@ -1716,7 +1694,6 @@ class Main(star.Star):
         }
         existing_lines = set(chats)
         new_lines: list[str] = []
-        image_registry_changed = False
         for entry in entries:
             line = str(entry.get("line") or "")
             message_id = self._normalize_message_id(entry.get("message_id") or "")
@@ -1728,25 +1705,18 @@ class Main(star.Star):
             existing_lines.add(line)
             if message_id:
                 existing_ids.add(message_id)
-                image_registry_changed = (
-                    self._register_history_image_sources(
-                        origin,
-                        message_id,
-                        list(entry.get("image_urls") or []),
-                        list(entry.get("cache_sources") or []),
-                    )
-                    or image_registry_changed
+                self._register_history_image_sources(
+                    origin,
+                    message_id,
+                    list(entry.get("image_urls") or []),
+                    list(entry.get("cache_sources") or []),
                 )
 
         if not new_lines:
-            if image_registry_changed:
-                self._persist_image_registry(cfg)
             return
         chats[:0] = new_lines
         if len(chats) > cfg.group_history.max_messages:
             del chats[: len(chats) - cfg.group_history.max_messages]
-        if image_registry_changed:
-            self._persist_image_registry(cfg)
         logger.debug(
             "enhance-mode | adapter history backfilled | origin=%s added=%s size=%s",
             origin,
@@ -3394,15 +3364,13 @@ class Main(star.Star):
         self._touch_origin(event.unified_msg_origin, cfg)
         chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
-        image_registry_changed = False
         if len(chats) > history_cfg.max_messages:
             removed_line = chats.pop(0)
             removed_msg_id = self._extract_message_id_from_history_line(removed_line)
             if removed_msg_id:
-                removed_entry = self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
-                image_registry_changed = removed_entry is not None
         if normalized_msg_id and image_urls:
             self.runtime.image_message_registry[event.unified_msg_origin][
                 normalized_msg_id
@@ -3410,9 +3378,7 @@ class Main(star.Star):
                 "urls": image_urls,
                 "cache_sources": image_cache_sources,
                 "captions": {},
-                "updated_at": time.time(),
             }
-            image_registry_changed = True
             logger.debug(
                 "enhance-mode | image message registered | origin=%s msg_id=%s image_count=%s deferred_caption=%s",
                 event.unified_msg_origin,
@@ -3420,8 +3386,6 @@ class Main(star.Star):
                 len(image_urls),
                 history_cfg.image_caption,
             )
-        if image_registry_changed:
-            self._persist_image_registry(cfg)
         logger.debug(
             "enhance-mode | group history updated | origin=%s size=%s",
             event.unified_msg_origin,
@@ -3585,17 +3549,13 @@ class Main(star.Star):
         self._touch_origin(event.unified_msg_origin, cfg)
         chats = self.runtime.session_chats[event.unified_msg_origin]
         chats.append(final_message)
-        image_registry_changed = False
         if len(chats) > cfg.group_history.max_messages:
             removed_line = chats.pop(0)
             removed_msg_id = self._extract_message_id_from_history_line(removed_line)
             if removed_msg_id:
-                removed_entry = self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
-                image_registry_changed = removed_entry is not None
-        if image_registry_changed:
-            self._persist_image_registry(cfg)
         logger.debug(
             "enhance-mode | bot response recorded | origin=%s size=%s",
             event.unified_msg_origin,
@@ -3617,10 +3577,7 @@ class Main(star.Star):
         clean_session = event.get_extra("_clean_ltm_session", False)
         if not clean_session:
             return
-        had_image_registry = origin in self.runtime.image_message_registry
         self.runtime.cleanup_origin(origin)
-        if had_image_registry:
-            self._persist_image_registry()
         logger.info(
             "enhance-mode | runtime session cache cleaned | origin=%s",
             origin,
@@ -3885,9 +3842,11 @@ class Main(star.Star):
             return
 
         origin = event.unified_msg_origin
-        message_registry = self.runtime.image_message_registry.get(origin, {})
-        message_entry = message_registry.get(normalized_message_id)
-        if not isinstance(message_entry, dict):
+        message_entry = await self._get_image_message_entry(
+            origin,
+            normalized_message_id,
+        )
+        if not isinstance(message_entry, dict) or not message_entry:
             yield self._make_text_tool_result(
                 f"Image message `{normalized_message_id}` not found in current runtime history. "
                 "Try a newer message ID from current chat context."
@@ -3936,10 +3895,6 @@ class Main(star.Star):
         if isinstance(cached_caption, str) and cached_caption.strip():
             caption = cached_caption.strip()
             caption_cached = True
-            await self._write_shared_image_caption_cache(
-                self._image_caption_sources(image_url, cache_source),
-                caption,
-            )
         elif history_requested:
             try:
                 if not cfg.group_history.image_caption:
@@ -3957,8 +3912,6 @@ class Main(star.Star):
                 caption = str(caption or "").strip()
                 if caption:
                     captions_map[image_idx] = caption
-                    message_entry["updated_at"] = time.time()
-                    self._persist_image_registry(cfg)
             except Exception as e:
                 logger.exception(
                     "enhance-mode | use_image caption failed | origin=%s msg_id=%s image_index=%s error=%s",
@@ -4436,6 +4389,5 @@ class Main(star.Star):
 
     async def terminate(self) -> None:
         logger.info("enhance-mode | plugin terminating")
-        self._persist_image_registry()
         await self._stop_memory_rag_webui()
         logger.info("enhance-mode | plugin terminated")
