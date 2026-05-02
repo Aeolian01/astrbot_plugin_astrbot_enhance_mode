@@ -53,6 +53,7 @@ from .tag_utils import (
     build_interaction_instructions,
     chain_has_refuse_tag,
     clean_response_text_for_history,
+    dedupe_repeated_result_chain,
     has_refuse_tag,
     transform_result_chain,
 )
@@ -3196,10 +3197,24 @@ class Main(star.Star):
             result.chain,
             parse_mention=cfg.group_features.mention_parse,
         )
-        if transformed is None:
-            return
+        if transformed is not None:
+            result.chain = transformed
 
-        result.chain = transformed
+        active_reply_triggered = self._is_truthy_extra(
+            self._get_extra_value(event, "_enhance_active_reply_triggered", False)
+        )
+        deduped = (
+            dedupe_repeated_result_chain(result.chain)
+            if active_reply_triggered
+            else None
+        )
+        if deduped is not None:
+            logger.info(
+                "enhance-mode | active duplicated reply chain collapsed | origin=%s parts=%s",
+                event.unified_msg_origin,
+                len(result.chain),
+            )
+            result.chain = deduped
 
     @filter.on_llm_response()
     async def record_bot_response(

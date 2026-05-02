@@ -78,6 +78,32 @@ def transform_result_chain(chain: list, parse_mention: bool) -> list | None:
     return new_chain
 
 
+def _component_identity(comp: object) -> tuple[str, object] | None:
+    if isinstance(comp, Plain):
+        return ("Plain", comp.text)
+    if isinstance(comp, At):
+        return ("At", getattr(comp, "qq", ""))
+    if isinstance(comp, Reply):
+        return ("Reply", getattr(comp, "id", ""))
+    return None
+
+
+def dedupe_repeated_result_chain(chain: list) -> list | None:
+    if len(chain) < 2 or len(chain) % 2 != 0:
+        return None
+
+    midpoint = len(chain) // 2
+    first_half = chain[:midpoint]
+    second_half = chain[midpoint:]
+    first_identities = [_component_identity(comp) for comp in first_half]
+    second_identities = [_component_identity(comp) for comp in second_half]
+    if any(identity is None for identity in first_identities + second_identities):
+        return None
+    if first_identities != second_identities:
+        return None
+    return first_half
+
+
 def clean_response_text_for_history(completion_text: str) -> str:
     text = MENTION_RE.sub(r"[At: \1]", completion_text)
     text = MENTION_CLOSE_RE.sub("", text)
@@ -120,6 +146,11 @@ def build_interaction_instructions(
             "The first characters MUST be `<refuse/>`, with no extra text before or after.\n"
             "Any other format will be treated as normal text and sent through."
         )
+    instructions += (
+        "\n\n## Tool calls\n"
+        "If you call any tool, do not include natural-language reply text in the same assistant message. "
+        "After the tool result is available, output the final group reply exactly once."
+    )
     return instructions
 
 
