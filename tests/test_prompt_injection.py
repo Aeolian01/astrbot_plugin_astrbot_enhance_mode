@@ -4,6 +4,7 @@ import pytest
 
 from astrbot.api.platform import MessageType
 
+import astrbot_plugin_astrbot_enhance_mode.main as main_module
 from astrbot_plugin_astrbot_enhance_mode.main import Main
 from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     ActiveReplyConfig,
@@ -44,6 +45,12 @@ class _DummyRequest:
 
 class _DummyFace:
     id = 462
+
+
+class _DummyImage:
+    def __init__(self, *, url: str = "", file: str = "") -> None:
+        self.url = url
+        self.file = file
 
 
 class _DummyFaceMessageObj:
@@ -166,3 +173,27 @@ async def test_group_message_with_only_face_component_is_not_skipped() -> None:
     assert body == "[QQ表情: id=462, 含义=未知]"
     assert image_urls == []
     assert image_cache_sources == []
+
+
+def test_image_message_uses_file_as_shared_caption_cache_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    monkeypatch.setattr(main_module, "Image", _DummyImage)
+
+    class ImageEvent(_DummyEvent):
+        def get_messages(self) -> list[object]:
+            return [
+                _DummyImage(
+                    url="https://example.com/download?id=abc",
+                    file="D486F2DB1F7B6087234AC5C1050723C6.png",
+                )
+            ]
+
+    body, image_urls, image_cache_sources = plugin._format_event_message_body(
+        ImageEvent()
+    )
+
+    assert body == "[Image]"
+    assert image_urls == ["https://example.com/download?id=abc"]
+    assert image_cache_sources == ["D486F2DB1F7B6087234AC5C1050723C6.png"]
