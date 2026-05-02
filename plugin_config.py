@@ -146,6 +146,7 @@ class WebSearchConfig:
     timeout_sec: float = 60.0
     request_mode: str = "auto"
     base_url_override: str = ""
+    proxy_url: str = ""
     show_sources: bool = False
     max_sources: int = 5
 
@@ -282,6 +283,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         timeout_sec=_to_pos_float(web_search_raw.get("timeout_sec"), 60.0),
         request_mode=request_mode,
         base_url_override=str(web_search_raw.get("base_url_override") or "").strip(),
+        proxy_url=str(web_search_raw.get("proxy_url") or "").strip(),
         show_sources=_to_bool(web_search_raw.get("show_sources"), False),
         max_sources=max(0, _to_int(web_search_raw.get("max_sources"), 5)),
     )
