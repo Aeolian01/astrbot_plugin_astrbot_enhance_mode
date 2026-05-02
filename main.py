@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import importlib
 import json
 import mimetypes
 import random
@@ -27,56 +28,6 @@ from astrbot.core.provider.provider import EmbeddingProvider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.io import download_image_by_url
 
-try:
-    from astrbot_plugin_forward_context import (
-        build_image_caption_sources as forward_build_image_caption_sources,
-        get_cached_image_caption as forward_get_cached_image_caption,
-        get_cached_image_message as forward_get_cached_image_message,
-        get_or_create_image_caption as forward_get_or_create_image_caption,
-        parse_history_message as forward_parse_history_message,
-    )
-    FORWARD_CONTEXT_AVAILABLE = True
-except Exception:
-    FORWARD_CONTEXT_AVAILABLE = False
-
-    def forward_build_image_caption_sources(
-        image_url: str = "",
-        cache_source: str = "",
-        extra_sources: Any = None,
-    ) -> list[str]:
-        sources: list[str] = []
-        for source in (cache_source, image_url):
-            clean = str(source or "").strip()
-            if clean and clean not in sources:
-                sources.append(clean)
-        if isinstance(extra_sources, (list, tuple, set)):
-            for source in extra_sources:
-                clean = str(source or "").strip()
-                if clean and clean not in sources:
-                    sources.append(clean)
-        return sources
-
-    async def forward_get_cached_image_caption(source: Any) -> str:
-        return ""
-
-    async def forward_get_cached_image_message(origin: str, message_id: str) -> dict:
-        return {}
-
-    async def forward_get_or_create_image_caption(
-        event: Any,
-        image_url: str,
-        *,
-        cache_source: str = "",
-        extra_sources: Any = None,
-        provider_id: str = "",
-        prompt: str = "",
-        timeout_sec: float | None = None,
-    ) -> str:
-        return ""
-
-    async def forward_parse_history_message(event: Any, message: Any) -> str:
-        return ""
-
 from .ban_control import BanStore, parse_duration_seconds
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
@@ -100,6 +51,77 @@ FORWARD_CONTEXT_IDS_KEY = "_forward_context_ids"
 ENHANCE_ACTIVE_REPLY_PROMPT_KEY = "_enhance_active_reply_prompt"
 ACTIVE_MESSAGE_TEXT_LIMIT = 4000
 ACTIVE_REPLY_PENDING_TTL_SEC = 180.0
+FORWARD_CONTEXT_API_ATTRS = (
+    "build_image_caption_sources",
+    "get_cached_image_caption",
+    "get_cached_image_message",
+    "get_or_create_image_caption",
+    "parse_history_message",
+)
+FORWARD_CONTEXT_API_ERROR_LOG_INTERVAL_SEC = 60.0
+_FORWARD_CONTEXT_API: dict[str, Any] | None = None
+_FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT = 0.0
+
+
+def _fallback_build_image_caption_sources(
+    image_url: str = "",
+    cache_source: str = "",
+    extra_sources: Any = None,
+) -> list[str]:
+    sources: list[str] = []
+    for source in (cache_source, image_url):
+        clean = str(source or "").strip()
+        if clean and clean not in sources:
+            sources.append(clean)
+    if isinstance(extra_sources, (list, tuple, set)):
+        for source in extra_sources:
+            clean = str(source or "").strip()
+            if clean and clean not in sources:
+                sources.append(clean)
+    return sources
+
+
+def _log_forward_context_api_unavailable(error: object) -> None:
+    global _FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT
+
+    now = time.monotonic()
+    if (
+        _FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT
+        and now - _FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT
+        < FORWARD_CONTEXT_API_ERROR_LOG_INTERVAL_SEC
+    ):
+        return
+    _FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT = now
+    logger.debug(
+        "enhance-mode | forward-context API unavailable; shared caption/history bridge disabled for now | error=%s",
+        error,
+    )
+
+
+def _get_forward_context_api() -> dict[str, Any] | None:
+    global _FORWARD_CONTEXT_API
+
+    if _FORWARD_CONTEXT_API is not None:
+        return _FORWARD_CONTEXT_API
+
+    try:
+        module = importlib.import_module("astrbot_plugin_forward_context")
+        missing = [
+            attr for attr in FORWARD_CONTEXT_API_ATTRS if not hasattr(module, attr)
+        ]
+        if missing:
+            raise AttributeError(
+                "astrbot_plugin_forward_context missing public API: "
+                + ", ".join(missing)
+            )
+        _FORWARD_CONTEXT_API = {
+            attr: getattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS
+        }
+        logger.debug("enhance-mode | forward-context API resolved")
+        return _FORWARD_CONTEXT_API
+    except Exception as e:
+        _log_forward_context_api_unavailable(e)
+        return None
 
 
 class Main(star.Star):
@@ -524,10 +546,26 @@ class Main(star.Star):
 
     @staticmethod
     def _image_caption_sources(image_url: str, cache_source: str = "") -> list[str]:
-        return forward_build_image_caption_sources(
-            image_url=image_url,
-            cache_source=cache_source,
-        )
+        api = _get_forward_context_api()
+        if api is None:
+            return _fallback_build_image_caption_sources(
+                image_url=image_url,
+                cache_source=cache_source,
+            )
+        try:
+            return api["build_image_caption_sources"](
+                image_url=image_url,
+                cache_source=cache_source,
+            )
+        except Exception as e:
+            logger.debug(
+                "enhance-mode | forward-context image caption source build failed; using fallback | error=%s",
+                e,
+            )
+            return _fallback_build_image_caption_sources(
+                image_url=image_url,
+                cache_source=cache_source,
+            )
 
     @staticmethod
     def _is_captionable_image_ref(image_ref: str) -> bool:
@@ -542,8 +580,11 @@ class Main(star.Star):
             return False
 
     async def _read_shared_image_caption_cache(self, sources: list[str]) -> str:
+        api = _get_forward_context_api()
+        if api is None:
+            return ""
         try:
-            caption = await forward_get_cached_image_caption(sources)
+            caption = await api["get_cached_image_caption"](sources)
         except Exception as e:
             logger.debug(
                 "enhance-mode | shared image caption cache read failed | sources=%s error=%s",
@@ -573,8 +614,11 @@ class Main(star.Star):
             local_urls = local_entry.get("urls")
             if isinstance(local_urls, list) and local_urls:
                 return local_entry
+        api = _get_forward_context_api()
+        if api is None:
+            return local_entry if isinstance(local_entry, dict) else {}
         try:
-            entry = await forward_get_cached_image_message(origin, normalized_msg_id)
+            entry = await api["get_cached_image_message"](origin, normalized_msg_id)
         except Exception as e:
             logger.debug(
                 "enhance-mode | forward image message read failed | origin=%s msg_id=%s error=%s",
@@ -619,14 +663,11 @@ class Main(star.Star):
                 return cached_after_wait
 
             final_prompt = str(prompt or "").strip() or cfg.group_history.image_caption_prompt
-            if not FORWARD_CONTEXT_AVAILABLE:
-                logger.debug(
-                    "enhance-mode | forward-context unavailable; skip local image caption | image_url=%s",
-                    clean_image_url,
-                )
+            api = _get_forward_context_api()
+            if api is None:
                 return ""
             try:
-                caption = await forward_get_or_create_image_caption(
+                caption = await api["get_or_create_image_caption"](
                     event,
                     clean_image_url,
                     cache_source=cache_source,
@@ -1363,8 +1404,11 @@ class Main(star.Star):
             message
         ) and not self._history_content_has_forward_context_payload(raw_parts):
             return ""
+        api = _get_forward_context_api()
+        if api is None:
+            return ""
         try:
-            text = await forward_parse_history_message(event, message)
+            text = await api["parse_history_message"](event, message)
         except Exception as e:
             logger.debug(
                 "enhance-mode | forward-context history parse failed | error=%s",

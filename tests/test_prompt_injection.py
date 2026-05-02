@@ -323,7 +323,11 @@ async def test_shared_caption_cache_reads_alias_batch(
         assert source_or_sources == sources
         return "缓存图片描述"
 
-    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached)
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: {"get_cached_image_caption": get_cached},
+    )
 
     caption = await plugin._read_shared_image_caption_cache(sources)
 

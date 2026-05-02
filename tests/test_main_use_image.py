@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 
 from mcp import types as mcp_types
 import pytest
@@ -38,6 +39,80 @@ def _payload_from_results(
     results: list[mcp_types.CallToolResult],
 ) -> dict[str, object]:
     return json.loads(results[-1].content[0].text)
+
+
+def _forward_context_api(
+    *,
+    build_image_caption_sources=None,  # noqa: ANN001
+    get_cached_image_caption=None,  # noqa: ANN001
+    get_cached_image_message=None,  # noqa: ANN001
+    get_or_create_image_caption=None,  # noqa: ANN001
+    parse_history_message=None,  # noqa: ANN001
+) -> dict[str, object]:
+    async def empty_caption(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    async def empty_message(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return {}
+
+    async def empty_parse(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    return {
+        "build_image_caption_sources": build_image_caption_sources
+        or main_module._fallback_build_image_caption_sources,
+        "get_cached_image_caption": get_cached_image_caption or empty_caption,
+        "get_cached_image_message": get_cached_image_message or empty_message,
+        "get_or_create_image_caption": get_or_create_image_caption or empty_caption,
+        "parse_history_message": parse_history_message or empty_parse,
+    }
+
+
+def test_forward_context_api_retries_after_initial_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def build_image_caption_sources(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return []
+
+    async def get_cached_image_caption(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    async def get_cached_image_message(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return {}
+
+    async def get_or_create_image_caption(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    async def parse_history_message(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return ""
+
+    fake_module = types.SimpleNamespace(
+        build_image_caption_sources=build_image_caption_sources,
+        get_cached_image_caption=get_cached_image_caption,
+        get_cached_image_message=get_cached_image_message,
+        get_or_create_image_caption=get_or_create_image_caption,
+        parse_history_message=parse_history_message,
+    )
+    calls = {"count": 0}
+
+    def import_module(name: str) -> object:
+        assert name == "astrbot_plugin_forward_context"
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise ModuleNotFoundError(name)
+        return fake_module
+
+    monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API", None)
+    monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT", 0.0)
+    monkeypatch.setattr(main_module.importlib, "import_module", import_module)
+
+    assert main_module._get_forward_context_api() is None
+    api = main_module._get_forward_context_api()
+
+    assert api is not None
+    assert api["build_image_caption_sources"] is build_image_caption_sources
+    assert main_module._get_forward_context_api() is api
+    assert calls["count"] == 2
 
 
 @pytest.mark.asyncio
@@ -103,8 +178,10 @@ async def test_use_image_can_use_forward_context_registry(
 
     monkeypatch.setattr(
         main_module,
-        "forward_get_cached_image_message",
-        get_cached_image_message,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_message=get_cached_image_message,
+        ),
     )
     plugin._resolve_image_ref_to_local_path = resolve_local_path
     plugin._encode_image_file = lambda _path: ("cmVzdG9yZWQ=", "image/png")
@@ -152,12 +229,13 @@ async def test_use_image_default_mode_attaches_and_writes_history(
         applied.update(kwargs)
         return True
 
-    monkeypatch.setattr(main_module, "FORWARD_CONTEXT_AVAILABLE", True)
-    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached_caption)
     monkeypatch.setattr(
         main_module,
-        "forward_get_or_create_image_caption",
-        get_or_create_caption,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_caption=get_cached_caption,
+            get_or_create_image_caption=get_or_create_caption,
+        ),
     )
 
     plugin._get_image_caption = should_not_be_called
@@ -209,12 +287,13 @@ async def test_use_image_delegates_caption_creation_to_forward_context(
     async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
         raise AssertionError("_get_image_caption should not be called after forward hit")
 
-    monkeypatch.setattr(main_module, "FORWARD_CONTEXT_AVAILABLE", True)
-    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached_caption)
     monkeypatch.setattr(
         main_module,
-        "forward_get_or_create_image_caption",
-        get_or_create_caption,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_caption=get_cached_caption,
+            get_or_create_image_caption=get_or_create_caption,
+        ),
     )
 
     plugin._get_image_caption = should_not_be_called
@@ -269,12 +348,13 @@ async def test_use_image_history_only_mode_does_not_attach_image(
         applied["count"] += 1
         return True
 
-    monkeypatch.setattr(main_module, "FORWARD_CONTEXT_AVAILABLE", True)
-    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached_caption)
     monkeypatch.setattr(
         main_module,
-        "forward_get_or_create_image_caption",
-        get_or_create_caption,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_caption=get_cached_caption,
+            get_or_create_image_caption=get_or_create_caption,
+        ),
     )
 
     plugin._get_image_caption = should_not_be_called
@@ -319,12 +399,13 @@ async def test_use_image_does_not_fallback_to_local_caption_when_forward_context
     async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
         raise AssertionError("_get_image_caption should not be called on forward miss")
 
-    monkeypatch.setattr(main_module, "FORWARD_CONTEXT_AVAILABLE", True)
-    monkeypatch.setattr(main_module, "forward_get_cached_image_caption", get_cached_caption)
     monkeypatch.setattr(
         main_module,
-        "forward_get_or_create_image_caption",
-        get_or_create_caption,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_caption=get_cached_caption,
+            get_or_create_image_caption=get_or_create_caption,
+        ),
     )
 
     plugin._get_image_caption = should_not_be_called
@@ -348,6 +429,104 @@ async def test_use_image_does_not_fallback_to_local_caption_when_forward_context
     assert payload["success"] is False
     assert payload["write_to_history_success"] is False
     assert payload["write_to_history_error"] == "Image description is empty."
+
+
+@pytest.mark.asyncio
+async def test_caption_image_with_cache_can_recover_after_resolver_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, event = _build_plugin(image_caption=True)
+    cfg = plugin._cfg()
+    available = {"value": False}
+
+    async def get_or_create_caption(*args, **kwargs):  # noqa: ANN002, ANN003
+        _ = args, kwargs
+        return "Lazy caption"
+
+    async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
+        _ = args, kwargs
+        raise AssertionError("_get_image_caption should not be called")
+
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: (
+            _forward_context_api(get_or_create_image_caption=get_or_create_caption)
+            if available["value"]
+            else None
+        ),
+    )
+    plugin._get_image_caption = should_not_be_called
+
+    first_caption = await plugin._caption_image_with_cache(
+        event,
+        cfg,
+        image_url="https://example.com/image.png",
+    )
+    available["value"] = True
+    second_caption = await plugin._caption_image_with_cache(
+        event,
+        cfg,
+        image_url="https://example.com/image.png",
+    )
+
+    assert first_caption == ""
+    assert second_caption == "Lazy caption"
+
+
+@pytest.mark.asyncio
+async def test_caption_image_with_cache_uses_shared_cache_without_creating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, event = _build_plugin(image_caption=True)
+    cfg = plugin._cfg()
+
+    async def get_cached_caption(_sources: object) -> str:
+        return "Cached caption"
+
+    async def should_not_create(*args, **kwargs):  # noqa: ANN002, ANN003
+        _ = args, kwargs
+        raise AssertionError("get_or_create_image_caption should not be called")
+
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_caption=get_cached_caption,
+            get_or_create_image_caption=should_not_create,
+        ),
+    )
+
+    caption = await plugin._caption_image_with_cache(
+        event,
+        cfg,
+        image_url="https://example.com/image.png",
+    )
+
+    assert caption == "Cached caption"
+
+
+@pytest.mark.asyncio
+async def test_caption_image_with_cache_skips_when_forward_context_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, event = _build_plugin(image_caption=True)
+    cfg = plugin._cfg()
+
+    async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
+        _ = args, kwargs
+        raise AssertionError("_get_image_caption should not be called")
+
+    monkeypatch.setattr(main_module, "_get_forward_context_api", lambda: None)
+    plugin._get_image_caption = should_not_be_called
+
+    caption = await plugin._caption_image_with_cache(
+        event,
+        cfg,
+        image_url="https://example.com/image.png",
+    )
+
+    assert caption == ""
 
 
 @pytest.mark.asyncio
