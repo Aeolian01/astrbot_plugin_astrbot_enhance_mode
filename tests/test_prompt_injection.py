@@ -58,6 +58,37 @@ class _DummyImage:
         self.file = file
 
 
+class Poke:
+    pass
+
+
+class _DummyPokeMessageObj:
+    message_id = "poke-1"
+    message = [Poke()]
+    raw_message = {"user_id": "10001", "target_id": "99999"}
+
+    class Sender:
+        nickname = "Alice"
+        user_id = "10001"
+
+    sender = Sender()
+
+
+class _DummyPokeEvent(_DummyEvent):
+    unified_msg_origin = "origin-poke"
+    message_obj = _DummyPokeMessageObj()
+    message_str = ""
+
+    def get_messages(self) -> list[object]:
+        return self.message_obj.message
+
+    def get_sender_id(self) -> str:
+        return "10001"
+
+    def get_sender_name(self) -> str:
+        return "Alice"
+
+
 class _DummyFaceMessageObj:
     message_id = "face-1"
     message = [_DummyFace()]
@@ -142,6 +173,20 @@ async def test_passive_injection_uses_request_prompt_for_empty_plugin_event() ->
     assert "Now, a new message is coming:" in req.prompt
     assert "Alice 戳了你一下，请用一句话回复。" in req.prompt
     assert "[Empty]" not in req.prompt
+    assert req.contexts == []
+
+
+@pytest.mark.asyncio
+async def test_passive_injection_prefers_request_prompt_for_poke_event() -> None:
+    plugin = _build_plugin()
+    event = _DummyPokeEvent()
+    req = _DummyRequest("Alice 戳了你一下，请用一句话回复。")
+
+    await plugin.inject_group_context(event, req)
+
+    assert "Now, a new message is coming:" in req.prompt
+    assert "Alice 戳了你一下，请用一句话回复。" in req.prompt
+    assert "[戳一戳: Alice/10001 -> 99999]" not in req.prompt
     assert req.contexts == []
 
 
@@ -265,6 +310,18 @@ async def test_group_message_with_only_face_component_is_not_skipped() -> None:
     assert called == {"record": True, "active": True}
     body, image_urls, image_cache_sources = plugin._format_event_message_body(event)
     assert body == "[QQ表情: id=462, 含义=未知]"
+    assert image_urls == []
+    assert image_cache_sources == []
+
+
+def test_poke_message_body_includes_sender_and_target() -> None:
+    plugin = _build_plugin()
+    event = _DummyPokeEvent()
+
+    body, image_urls, image_cache_sources = plugin._format_event_message_body(event)
+
+    assert body == "[戳一戳: Alice/10001 -> 99999]"
+    assert Main._is_action_only_text(body)
     assert image_urls == []
     assert image_cache_sources == []
 

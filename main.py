@@ -456,16 +456,21 @@ class Main(star.Star):
             elif isinstance(comp, At):
                 parts.append(f" [At: {comp.name}]")
             else:
-                fallback = self._format_unknown_message_component(comp)
+                fallback = self._format_unknown_message_component(comp, event)
                 if fallback:
                     parts.append(fallback)
 
         return "".join(parts).strip(), image_urls, image_cache_sources
 
     @staticmethod
-    def _format_unknown_message_component(comp: Any) -> str:
+    def _format_unknown_message_component(
+        comp: Any, event: AstrMessageEvent | None = None
+    ) -> str:
         comp_name = type(comp).__name__
         normalized_name = comp_name.strip().lower()
+        if normalized_name == "poke":
+            return Main._format_poke_message_component(comp, event)
+
         if normalized_name in {"face", "emoji", "mface"}:
             face_id = ""
             for attr in ("id", "face_id", "emoji_id"):
@@ -506,6 +511,122 @@ class Main(star.Star):
             if clean:
                 return f" [{label}: {clean}]"
         return f" [{label}]"
+
+    @staticmethod
+    def _object_attr_text(obj: Any, *attrs: str) -> str:
+        if obj is None:
+            return ""
+        for attr in attrs:
+            try:
+                value = (
+                    obj.get(attr)
+                    if isinstance(obj, dict)
+                    else getattr(obj, attr, None)
+                )
+            except Exception:
+                continue
+            clean = "" if value is None else str(value).strip()
+            if clean:
+                return clean
+        return ""
+
+    @staticmethod
+    def _event_sender_name(event: AstrMessageEvent | None) -> str:
+        if event is None:
+            return ""
+        getter = getattr(event, "get_sender_name", None)
+        if callable(getter):
+            try:
+                name = str(getter() or "").strip()
+                if name:
+                    return name
+            except Exception:
+                pass
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        return Main._object_attr_text(sender, "card", "nickname", "name", "user_name")
+
+    @staticmethod
+    def _event_sender_id(event: AstrMessageEvent | None) -> str:
+        if event is None:
+            return ""
+        getter = getattr(event, "get_sender_id", None)
+        if callable(getter):
+            try:
+                sender_id = str(getter() or "").strip()
+                if sender_id:
+                    return sender_id
+            except Exception:
+                pass
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        return Main._object_attr_text(sender, "user_id", "id", "qq", "uid")
+
+    @staticmethod
+    def _format_actor_label(name: str = "", user_id: str = "") -> str:
+        clean_name = str(name or "").strip()
+        clean_id = str(user_id or "").strip()
+        if clean_name and clean_id and clean_name != clean_id:
+            return f"{clean_name}/{clean_id}"
+        return clean_name or clean_id
+
+    @staticmethod
+    def _format_poke_message_component(
+        comp: Any, event: AstrMessageEvent | None = None
+    ) -> str:
+        message_obj = getattr(event, "message_obj", None) if event is not None else None
+        raw_message = getattr(message_obj, "raw_message", None)
+        sender = getattr(message_obj, "sender", None)
+
+        actor_name = (
+            Main._object_attr_text(
+                comp,
+                "operator_nick",
+                "sender_nickname",
+                "nickname",
+                "card",
+                "name",
+            )
+            or Main._object_attr_text(
+                raw_message,
+                "operator_nick",
+                "sender_nickname",
+                "nickname",
+                "card",
+                "name",
+            )
+            or Main._event_sender_name(event)
+        )
+        actor_id = (
+            Main._object_attr_text(
+                comp, "user_id", "sender_id", "operator_id", "from_id"
+            )
+            or Main._object_attr_text(
+                raw_message, "user_id", "sender_id", "operator_id", "from_id"
+            )
+            or Main._event_sender_id(event)
+            or Main._object_attr_text(sender, "user_id", "id", "qq", "uid")
+        )
+        target_name = (
+            Main._object_attr_text(comp, "target_nickname", "target_name", "target_card")
+            or Main._object_attr_text(
+                raw_message, "target_nickname", "target_name", "target_card"
+            )
+        )
+        target_id = (
+            Main._object_attr_text(comp, "target_id", "target_user_id", "target_qq")
+            or Main._object_attr_text(
+                raw_message, "target_id", "target_user_id", "target_qq"
+            )
+        )
+
+        actor_label = Main._format_actor_label(actor_name, actor_id)
+        target_label = Main._format_actor_label(target_name, target_id)
+        if actor_label and target_label:
+            return f" [戳一戳: {actor_label} -> {target_label}]"
+        if actor_label:
+            return f" [戳一戳: {actor_label}]"
+        if target_label:
+            return f" [戳一戳: -> {target_label}]"
+        return " [戳一戳]"
 
     @staticmethod
     def _is_action_only_text(text: str) -> bool:
@@ -3656,6 +3777,13 @@ class Main(star.Star):
         request_prompt = str(getattr(req, "prompt", "") or "").strip()
         if (
             current_message_source == "empty"
+            and request_prompt
+            and request_prompt != "[Empty]"
+        ):
+            current_message_text = request_prompt
+            current_message_source = "provider_request.prompt"
+        elif (
+            self._is_action_only_text(current_message_text)
             and request_prompt
             and request_prompt != "[Empty]"
         ):
