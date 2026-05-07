@@ -83,6 +83,28 @@ class _DummyFaceEvent:
         return "10001"
 
 
+class _DummyForwardMessageObj:
+    message_id = "fwd-1"
+    message: list[object] = []
+
+    class Sender:
+        nickname = "Alice"
+
+    sender = Sender()
+
+
+class _DummyForwardEvent(_DummyEvent):
+    unified_msg_origin = "origin-forward"
+    message_obj = _DummyForwardMessageObj()
+    message_str = "[json]"
+
+    def get_messages(self) -> list[object]:
+        return []
+
+    def get_sender_id(self) -> str:
+        return "20001"
+
+
 def _build_plugin() -> Main:
     plugin = Main.__new__(Main)
     plugin.runtime = RuntimeState()
@@ -153,6 +175,65 @@ async def test_passive_injection_backfills_history_for_empty_plugin_event() -> N
     assert "刚才大家在聊午饭" in req.prompt
     assert "有没有人想喝奶茶" in req.prompt
     assert "(no recent group chat history)" not in req.prompt
+
+@pytest.mark.asyncio
+async def test_model_choice_parses_forward_context_before_stack_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    cfg = PluginConfig(
+        group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
+        group_history=GroupHistoryEnhancementConfig(enable=True),
+        active_reply=ActiveReplyConfig(
+            enable=True,
+            mode="model_choice",
+            model_stack_size=1,
+            model_history_messages=0,
+        ),
+    )
+    event = _DummyForwardEvent()
+    expanded = "expanded current forward text"
+    prompts: list[str] = []
+
+    plugin.runtime.session_chats[event.unified_msg_origin].append(
+        "[Alice/20001/12:00:00] #msgfwd-1: [json]"
+    )
+
+    async def parse_current(parse_event: _DummyForwardEvent) -> str:
+        assert parse_event is event
+        parse_event.set_extra(main_module.FORWARD_CONTEXT_TEXT_KEY, expanded)
+        parse_event.set_extra(main_module.FORWARD_CONTEXT_FOUND_KEY, True)
+        parse_event.set_extra(main_module.FORWARD_CONTEXT_IDS_KEY, ["res-1"])
+        return expanded
+
+    class FakeProvider:
+        async def text_chat(self, *, prompt: str, **_kwargs: object) -> object:
+            prompts.append(prompt)
+
+            class Response:
+                completion_text = "SKIP"
+
+            return Response()
+
+    async def resolve_persona_mask(_event: _DummyForwardEvent) -> tuple[str, str]:
+        return "default", "persona"
+
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: {"parse_current_message": parse_current},
+    )
+    plugin._resolve_model_choice_provider = lambda _event, _cfg: FakeProvider()
+    plugin._resolve_persona_mask = resolve_persona_mask
+
+    assert await plugin._need_active_reply_model_choice(event, cfg) is False
+
+    assert prompts
+    assert expanded in prompts[0]
+    assert "[json]" not in prompts[0]
+    assert plugin.runtime.session_chats[event.unified_msg_origin] == [
+        f"[Alice/20001/12:00:00] #msgfwd-1: {expanded}"
+    ]
 
 
 @pytest.mark.asyncio

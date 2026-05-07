@@ -2,6 +2,7 @@ import asyncio
 import base64
 import datetime
 import importlib
+import inspect
 import json
 import mimetypes
 import random
@@ -59,6 +60,7 @@ FORWARD_CONTEXT_API_ATTRS = (
     "get_or_create_image_caption",
     "parse_history_message",
 )
+FORWARD_CONTEXT_OPTIONAL_API_ATTRS = ("parse_current_message",)
 FORWARD_CONTEXT_API_ERROR_LOG_INTERVAL_SEC = 60.0
 _FORWARD_CONTEXT_API: dict[str, Any] | None = None
 _FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT = 0.0
@@ -116,7 +118,11 @@ def _module_looks_like_forward_context(module_name: str, module: object) -> bool
 def _api_from_forward_context_module(module: object) -> dict[str, Any] | None:
     if any(not hasattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS):
         return None
-    return {attr: getattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS}
+    api = {attr: getattr(module, attr) for attr in FORWARD_CONTEXT_API_ATTRS}
+    for attr in FORWARD_CONTEXT_OPTIONAL_API_ATTRS:
+        if hasattr(module, attr):
+            api[attr] = getattr(module, attr)
+    return api
 
 
 def _find_loaded_forward_context_api() -> dict[str, Any] | None:
@@ -222,6 +228,22 @@ class Main(star.Star):
         return default
 
     @staticmethod
+    def _set_extra_value(event: AstrMessageEvent, key: str, value: Any) -> bool:
+        try:
+            setter = getattr(event, "set_extra", None)
+            if callable(setter):
+                setter(key, value)
+                return True
+        except Exception:
+            pass
+
+        extra = getattr(event, "extra", None)
+        if isinstance(extra, dict):
+            extra[key] = value
+            return True
+        return False
+
+    @staticmethod
     def _is_truthy_extra(value: Any) -> bool:
         if isinstance(value, bool):
             return value
@@ -287,6 +309,89 @@ class Main(star.Star):
         ):
             return text
         return ""
+
+    def _replace_current_history_line_body(
+        self, event: AstrMessageEvent, text: str
+    ) -> bool:
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return False
+
+        origin = event.unified_msg_origin
+        current_msg_id = self._normalize_message_id(
+            getattr(event.message_obj, "message_id", "")
+        )
+        current_line = self._find_history_line_by_message_id(origin, current_msg_id)
+        if not current_line:
+            return False
+
+        matched = MSG_ID_PATTERN.search(current_line)
+        if matched:
+            new_line = f"{current_line[: matched.end()]} {clean_text}"
+        else:
+            new_line = clean_text
+        return self._replace_history_line_by_message_id(
+            origin,
+            current_msg_id,
+            new_line,
+        )
+
+    async def _parse_forward_context_current_message(
+        self, event: AstrMessageEvent
+    ) -> str:
+        if not self._event_looks_forward_like(event):
+            return ""
+
+        api = _get_forward_context_api()
+        parser = api.get("parse_current_message") if isinstance(api, dict) else None
+        if not callable(parser):
+            logger.info(
+                "enhance-mode | forward context status | found=%s ids=%s text_len=%s",
+                False,
+                [],
+                0,
+            )
+            return ""
+
+        try:
+            parsed_result = parser(event)
+            if inspect.isawaitable(parsed_result):
+                parsed_result = await parsed_result
+        except Exception as e:
+            logger.debug(
+                "enhance-mode | forward-context current parse failed | error=%s",
+                e,
+            )
+            logger.info(
+                "enhance-mode | forward context status | found=%s ids=%s text_len=%s",
+                False,
+                [],
+                0,
+            )
+            return ""
+
+        parsed_text = str(parsed_result or "").strip()
+        if parsed_text and not self._get_forward_context_text(event):
+            self._set_extra_value(event, FORWARD_CONTEXT_TEXT_KEY, parsed_text)
+            self._set_extra_value(event, FORWARD_CONTEXT_FOUND_KEY, True)
+            self._set_extra_value(event, FORWARD_CONTEXT_IDS_KEY, [])
+
+        forward_text = self._get_forward_context_text(event)
+        found = self._is_truthy_extra(
+            self._get_extra_value(event, FORWARD_CONTEXT_FOUND_KEY, False)
+        )
+        ids = self._get_extra_value(event, FORWARD_CONTEXT_IDS_KEY, [])
+        if not isinstance(ids, list):
+            ids = [ids] if ids else []
+        logger.info(
+            "enhance-mode | forward context status | found=%s ids=%s text_len=%s",
+            found,
+            ids,
+            len(forward_text),
+        )
+        if forward_text:
+            self._replace_current_history_line_body(event, forward_text)
+        return forward_text
 
     @staticmethod
     def _truncate_active_message_text(
@@ -1872,7 +1977,14 @@ class Main(star.Star):
         if forward_context_text:
             return (
                 self._truncate_active_message_text(forward_context_text),
-                "forward_context",
+                "forward_extra",
+            )
+
+        forward_context_text = await self._parse_forward_context_current_message(event)
+        if forward_context_text:
+            return (
+                self._truncate_active_message_text(forward_context_text),
+                "forward_parse_fallback",
             )
 
         origin = event.unified_msg_origin
@@ -1891,7 +2003,7 @@ class Main(star.Star):
                 if resolved_line:
                     return (
                         self._truncate_active_message_text(resolved_line),
-                        "session_chats",
+                        "history_line",
                     )
 
         body, image_urls, image_cache_sources = self._format_event_message_body(event)
@@ -1928,12 +2040,10 @@ class Main(star.Star):
                 )
 
         if body:
-            return self._truncate_active_message_text(body), "event_message_chain"
+            return self._truncate_active_message_text(body), "event_chain"
 
         fallback = (event.message_str or "").strip() or "[Empty]"
-        fallback_source = (
-            "event.message_str" if (event.message_str or "").strip() else "empty"
-        )
+        fallback_source = "message_str" if (event.message_str or "").strip() else "empty"
         return self._truncate_active_message_text(fallback), fallback_source
 
     async def _collect_active_reply_context(
@@ -1974,6 +2084,12 @@ class Main(star.Star):
                 recent_history_lines,
             )
 
+        logger.info(
+            "enhance-mode | current message resolved | origin=%s source=%s text_len=%s",
+            origin,
+            current_message_source or "unknown",
+            len(current_message_text),
+        )
         logger.info(
             "enhance-mode | context collected | origin=%s current_source=%s current_len=%s history_count=%s history_limit=%s",
             origin,
@@ -3098,6 +3214,11 @@ class Main(star.Star):
             persona_mask,
             history_context_lines,
         )
+        logger.info(
+            "enhance-mode | model_choice prompt built | prompt_len=%s history_count=%s",
+            len(judge_prompt),
+            len(history_context_lines),
+        )
 
         try:
             judge_resp = await asyncio.wait_for(
@@ -3142,7 +3263,7 @@ class Main(star.Star):
         self._touch_origin(origin, cfg)
 
         ar = cfg.active_reply
-        text = await self._build_active_message_text(event, cfg)
+        text, text_source = await self._resolve_active_current_message_text(event, cfg)
         text = self._truncate_active_message_text(text)
         nickname = event.message_obj.sender.nickname
         sender_id = event.get_sender_id()
@@ -3151,8 +3272,9 @@ class Main(star.Star):
             getattr(event.message_obj, "message_id", "")
         )
 
-        stack_line = self._find_history_line_by_message_id(origin, current_msg_id)
-        if not stack_line:
+        if text_source == "history_line":
+            stack_line = text
+        else:
             msg_marker = f" #msg{current_msg_id}:" if current_msg_id else ":"
             stack_line = f"[{nickname}/{sender_id}]{msg_marker} {text}"
         stack.append(stack_line)
@@ -3331,7 +3453,9 @@ class Main(star.Star):
 
         forward_context_text = self._get_forward_context_text(event)
         event_body, _, _ = self._format_event_message_body(event)
-        has_content = bool(event_body)
+        has_content = bool(
+            event_body or forward_context_text or self._event_looks_forward_like(event)
+        )
         if not has_content and not forward_context_text:
             return
 
