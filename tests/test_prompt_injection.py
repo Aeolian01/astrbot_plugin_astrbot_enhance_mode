@@ -85,6 +85,9 @@ class _DummyPokeEvent(_DummyEvent):
     def get_sender_id(self) -> str:
         return "10001"
 
+    def is_admin(self) -> bool:
+        return False
+
     def get_sender_name(self) -> str:
         return "Alice"
 
@@ -433,6 +436,36 @@ def test_image_message_uses_file_as_shared_caption_cache_source(
     assert image_cache_sources == ["D486F2DB1F7B6087234AC5C1050723C6.png"]
 
 
+def test_forward_context_text_keeps_image_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    monkeypatch.setattr(main_module, "Image", _DummyImage)
+
+    class ImageEvent(_DummyEvent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.set_extra(main_module.FORWARD_CONTEXT_TEXT_KEY, "[Image]")
+            self.set_extra(main_module.FORWARD_CONTEXT_PARSED_KEY, True)
+            self.set_extra(main_module.FORWARD_CONTEXT_IMAGE_COUNT_KEY, 1)
+
+        def get_messages(self) -> list[object]:
+            return [
+                _DummyImage(
+                    url="https://example.com/download?id=abc",
+                    file="D486F2DB1F7B6087234AC5C1050723C6.png",
+                )
+            ]
+
+    body, image_urls, image_cache_sources = plugin._format_event_message_body(
+        ImageEvent()
+    )
+
+    assert body == "[Image]"
+    assert image_urls == ["https://example.com/download?id=abc"]
+    assert image_cache_sources == ["D486F2DB1F7B6087234AC5C1050723C6.png"]
+
+
 def test_image_caption_sources_include_fileid_and_normalized_url() -> None:
     sources = Main._image_caption_sources(
         "https://example.com/get_image?fileid=abc&rkey=temp&token=secret&size=large",
@@ -452,6 +485,13 @@ async def test_shared_caption_cache_reads_alias_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = _build_plugin()
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: {
+            "build_image_caption_sources": main_module._fallback_build_image_caption_sources
+        },
+    )
     sources = Main._image_caption_sources(
         "https://example.com/get_image?fileid=abc&rkey=temp",
         "image.png",
@@ -470,3 +510,162 @@ async def test_shared_caption_cache_reads_alias_batch(
     caption = await plugin._read_shared_image_caption_cache(sources)
 
     assert caption == "缓存图片描述"
+
+
+def _caption_api(caption: str) -> dict[str, object]:
+    async def get_cached(_sources: object) -> str:
+        return ""
+
+    async def get_or_create(*_args: object, **_kwargs: object) -> str:
+        return caption
+
+    return {
+        "build_image_caption_sources": main_module._fallback_build_image_caption_sources,
+        "get_cached_image_caption": get_cached,
+        "get_or_create_image_caption": get_or_create,
+    }
+
+
+class _ImageForwardMessageObj:
+    message_id = "img-1"
+    message = [
+        _DummyImage(
+            url="https://example.com/image.png",
+            file="fileid:image-1",
+        )
+    ]
+
+    class Sender:
+        nickname = "Alice"
+
+    sender = Sender()
+
+
+class _ImageForwardEvent(_DummyEvent):
+    unified_msg_origin = "origin-image-forward"
+    message_obj = _ImageForwardMessageObj()
+    message_str = "[Image]"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_extra(main_module.FORWARD_CONTEXT_TEXT_KEY, "[Image]")
+        self.set_extra(main_module.FORWARD_CONTEXT_PARSED_KEY, True)
+        self.set_extra(main_module.FORWARD_CONTEXT_IMAGE_COUNT_KEY, 1)
+
+    def get_messages(self) -> list[object]:
+        return self.message_obj.message
+
+    def get_sender_id(self) -> str:
+        return "10001"
+
+    def is_admin(self) -> bool:
+        return False
+
+
+def _image_caption_cfg() -> PluginConfig:
+    return PluginConfig(
+        group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
+        group_history=GroupHistoryEnhancementConfig(enable=True, image_caption=True),
+        active_reply=ActiveReplyConfig(
+            enable=True,
+            mode="model_choice",
+            unified_context_messages=0,
+            model_stack_size=1,
+            model_history_messages=0,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_choice_receives_forward_context_image_caption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    plugin._image_caption_inflight = {}
+    cfg = _image_caption_cfg()
+    plugin._cfg = lambda: cfg
+    event = _ImageForwardEvent()
+    prompts: list[str] = []
+    monkeypatch.setattr(main_module, "Image", _DummyImage)
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: _caption_api("resolved image caption"),
+    )
+
+    class FakeProvider:
+        async def text_chat(self, *, prompt: str, **_kwargs: object) -> object:
+            prompts.append(prompt)
+
+            class Response:
+                completion_text = "SKIP"
+
+            return Response()
+
+    async def resolve_persona_mask(_event: _ImageForwardEvent) -> tuple[str, str]:
+        return "default", "persona"
+
+    plugin._resolve_model_choice_provider = lambda _event, _cfg: FakeProvider()
+    plugin._resolve_persona_mask = resolve_persona_mask
+    await plugin._record_message(event, cfg)
+
+    assert await plugin._need_active_reply_model_choice(event, cfg) is False
+
+    assert prompts
+    assert "[Image: resolved image caption]" in prompts[0]
+    assert "#msgimg-1" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_reply_prompts_receive_forward_context_image_caption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    plugin._image_caption_inflight = {}
+    cfg = _image_caption_cfg()
+    plugin._cfg = lambda: cfg
+    event = _ImageForwardEvent()
+    monkeypatch.setattr(main_module, "Image", _DummyImage)
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: _caption_api("reply image caption"),
+    )
+    await plugin._record_message(event, cfg)
+
+    active_context = await plugin._collect_active_reply_context(
+        event,
+        cfg,
+        backfill_target=0,
+    )
+    active_prompt = plugin._build_active_reply_prompt(
+        cfg,
+        active_context,
+        active_mode="model_choice",
+    )
+    req = _DummyRequest("[Empty]")
+
+    await plugin.inject_group_context(event, req)
+
+    assert "[Image: reply image caption]" in active_prompt
+    assert "[Image: reply image caption]" in req.prompt
+
+
+@pytest.mark.asyncio
+async def test_forward_context_video_text_reaches_reply_prompt() -> None:
+    plugin = _build_plugin()
+    cfg = PluginConfig(
+        group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
+        group_history=GroupHistoryEnhancementConfig(enable=True),
+        active_reply=ActiveReplyConfig(unified_context_messages=0),
+    )
+    plugin._cfg = lambda: cfg
+    event = _DummyEvent()
+    event.set_extra(main_module.FORWARD_CONTEXT_TEXT_KEY, "[Video: demo caption]")
+    event.set_extra(main_module.FORWARD_CONTEXT_PARSED_KEY, True)
+    event.set_extra(main_module.FORWARD_CONTEXT_VIDEO_COUNT_KEY, 1)
+    req = _DummyRequest("[Empty]")
+
+    await plugin.inject_group_context(event, req)
+
+    assert "[Video: demo caption]" in req.prompt

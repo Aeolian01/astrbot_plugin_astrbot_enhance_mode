@@ -50,6 +50,9 @@ MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
 FORWARD_CONTEXT_TEXT_KEY = "_forward_context_text"
 FORWARD_CONTEXT_FOUND_KEY = "_forward_context_found"
 FORWARD_CONTEXT_IDS_KEY = "_forward_context_ids"
+FORWARD_CONTEXT_PARSED_KEY = "_forward_context_parsed"
+FORWARD_CONTEXT_IMAGE_COUNT_KEY = "_forward_context_image_count"
+FORWARD_CONTEXT_VIDEO_COUNT_KEY = "_forward_context_video_count"
 ENHANCE_ACTIVE_REPLY_PROMPT_KEY = "_enhance_active_reply_prompt"
 ACTIVE_MESSAGE_TEXT_LIMIT = 4000
 ACTIVE_REPLY_PENDING_TTL_SEC = 180.0
@@ -252,6 +255,13 @@ class Main(star.Star):
         return bool(value)
 
     @staticmethod
+    def _positive_int_extra(value: Any) -> bool:
+        try:
+            return int(value) > 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _looks_forward_text(text: str) -> bool:
         normalized = str(text or "").strip().replace(" ", "")
         if not normalized:
@@ -292,6 +302,36 @@ class Main(star.Star):
             return True
         return False
 
+    def _event_has_media_component(
+        self, event: AstrMessageEvent, media_types: set[str] | None = None
+    ) -> bool:
+        media_types = media_types or {"image", "video"}
+        chains: list[Any] = []
+        try:
+            messages = event.get_messages()
+            if isinstance(messages, list):
+                chains.append(messages)
+        except Exception:
+            pass
+
+        msg_obj = getattr(event, "message_obj", None)
+        if msg_obj is not None:
+            message_chain = getattr(msg_obj, "message", None)
+            if isinstance(message_chain, list):
+                chains.append(message_chain)
+
+        for chain in chains:
+            for comp in chain:
+                comp_name = type(comp).__name__.strip().lower()
+                comp_type = str(
+                    getattr(comp, "type", "")
+                    or getattr(comp, "component_type", "")
+                    or ""
+                ).strip().lower()
+                if any(media_type in {comp_name, comp_type} for media_type in media_types):
+                    return True
+        return False
+
     def _get_forward_context_text(self, event: AstrMessageEvent) -> str:
         text = str(
             self._get_extra_value(event, FORWARD_CONTEXT_TEXT_KEY, "") or ""
@@ -301,9 +341,15 @@ class Main(star.Star):
 
         found = self._get_extra_value(event, FORWARD_CONTEXT_FOUND_KEY, False)
         ids = self._get_extra_value(event, FORWARD_CONTEXT_IDS_KEY, [])
+        parsed = self._get_extra_value(event, FORWARD_CONTEXT_PARSED_KEY, False)
+        image_count = self._get_extra_value(event, FORWARD_CONTEXT_IMAGE_COUNT_KEY, 0)
+        video_count = self._get_extra_value(event, FORWARD_CONTEXT_VIDEO_COUNT_KEY, 0)
         if (
             self._is_truthy_extra(found)
+            or self._is_truthy_extra(parsed)
             or bool(ids)
+            or self._positive_int_extra(image_count)
+            or self._positive_int_extra(video_count)
             or self._event_looks_forward_like(event)
             or self._looks_forward_text(text)
         ):
@@ -339,7 +385,9 @@ class Main(star.Star):
     async def _parse_forward_context_current_message(
         self, event: AstrMessageEvent
     ) -> str:
-        if not self._event_looks_forward_like(event):
+        if not self._event_looks_forward_like(event) and not self._event_has_media_component(
+            event
+        ):
             return ""
 
         api = _get_forward_context_api()
@@ -373,7 +421,7 @@ class Main(star.Star):
         parsed_text = str(parsed_result or "").strip()
         if parsed_text and not self._get_forward_context_text(event):
             self._set_extra_value(event, FORWARD_CONTEXT_TEXT_KEY, parsed_text)
-            self._set_extra_value(event, FORWARD_CONTEXT_FOUND_KEY, True)
+            self._set_extra_value(event, FORWARD_CONTEXT_PARSED_KEY, True)
             self._set_extra_value(event, FORWARD_CONTEXT_IDS_KEY, [])
 
         forward_text = self._get_forward_context_text(event)
@@ -428,14 +476,14 @@ class Main(star.Star):
         self, event: AstrMessageEvent
     ) -> tuple[str, list[str], list[str]]:
         forward_context_text = self._get_forward_context_text(event)
-        if forward_context_text:
-            return forward_context_text, [], []
 
         parts: list[str] = []
         image_urls: list[str] = []
         image_cache_sources: list[str] = []
         for comp in event.get_messages():
             if isinstance(comp, Reply):
+                if forward_context_text:
+                    continue
                 quote_nick = comp.sender_nickname or "Unknown"
                 quote_text = (comp.message_str or "").strip() or "..."
                 quote_id = self._normalize_message_id(getattr(comp, "id", ""))
@@ -446,20 +494,27 @@ class Main(star.Star):
                 else:
                     parts.append(f" [Quote {quote_nick}: {quote_text}]")
             elif isinstance(comp, Plain):
-                parts.append(f" {comp.text}")
+                if not forward_context_text:
+                    parts.append(f" {comp.text}")
             elif isinstance(comp, Image):
                 image_url = str(comp.url or comp.file or "").strip()
                 image_cache_source = str(comp.file or comp.url or "").strip()
                 image_urls.append(image_url)
                 image_cache_sources.append(image_cache_source or image_url)
-                parts.append(" [Image]")
+                if not forward_context_text:
+                    parts.append(" [Image]")
             elif isinstance(comp, At):
-                parts.append(f" [At: {comp.name}]")
+                if not forward_context_text:
+                    parts.append(f" [At: {comp.name}]")
             else:
+                if forward_context_text:
+                    continue
                 fallback = self._format_unknown_message_component(comp, event)
                 if fallback:
                     parts.append(fallback)
 
+        if forward_context_text:
+            return forward_context_text, image_urls, image_cache_sources
         return "".join(parts).strip(), image_urls, image_cache_sources
 
     @staticmethod
@@ -471,7 +526,9 @@ class Main(star.Star):
         if normalized_name == "poke":
             return Main._format_poke_message_component(comp, event)
 
-        if normalized_name in {"face", "emoji", "mface"}:
+        if normalized_name in {"face", "emoji", "mface"} or normalized_name.endswith(
+            "face"
+        ):
             face_id = ""
             for attr in ("id", "face_id", "emoji_id"):
                 face_id = str(getattr(comp, attr, "") or "").strip()
@@ -1076,6 +1133,89 @@ class Main(star.Star):
                 failed_count,
             )
         return resolved_lines
+
+    async def _resolve_image_captions_for_text(
+        self,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        text: str,
+        image_urls: list[str],
+        image_cache_sources: list[str] | None = None,
+        *,
+        origin: str = "",
+        message_id: str = "",
+    ) -> str:
+        current_text = str(text or "")
+        if not current_text or not image_urls or not cfg.group_history.image_caption:
+            return current_text
+
+        image_cache_sources = image_cache_sources or []
+        captions_map: dict[Any, Any] = {}
+        normalized_msg_id = self._normalize_message_id(message_id)
+        if origin and normalized_msg_id:
+            message_entry = self.runtime.image_message_registry.get(origin, {}).get(
+                normalized_msg_id
+            )
+            if isinstance(message_entry, dict):
+                captions_raw = message_entry.get("captions")
+                if isinstance(captions_raw, dict):
+                    captions_map = captions_raw
+                else:
+                    captions_map = {}
+                    message_entry["captions"] = captions_map
+
+        matches = list(IMAGE_MARKER_PATTERN.finditer(current_text))
+        for image_idx, marker in enumerate(matches):
+            if marker.group(0).startswith("[Image:"):
+                continue
+            if image_idx >= len(image_urls):
+                continue
+
+            cached_caption = captions_map.get(image_idx) or captions_map.get(
+                str(image_idx)
+            )
+            caption = (
+                cached_caption.strip()
+                if isinstance(cached_caption, str) and cached_caption.strip()
+                else ""
+            )
+            cache_source = (
+                str(image_cache_sources[image_idx] or "").strip()
+                if image_idx < len(image_cache_sources)
+                else ""
+            )
+            if not caption:
+                try:
+                    caption = await self._caption_image_with_cache(
+                        event,
+                        cfg,
+                        image_url=str(image_urls[image_idx] or "").strip(),
+                        cache_source=cache_source,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "enhance-mode | image caption text resolve failed | "
+                        "origin=%s msg_id=%s image_index=%s error=%s",
+                        origin or getattr(event, "unified_msg_origin", ""),
+                        normalized_msg_id,
+                        image_idx + 1,
+                        e,
+                    )
+                    continue
+                caption = str(caption or "").strip()
+                if not caption:
+                    continue
+                captions_map[image_idx] = caption
+
+            replaced_text, changed = self._replace_image_marker_at_index(
+                current_text,
+                image_idx,
+                caption,
+            )
+            if changed:
+                current_text = replaced_text
+
+        return current_text
 
     async def _resolve_image_ref_to_local_path(self, image_ref: str) -> str:
         clean_ref = str(image_ref or "").strip()
@@ -2096,6 +2236,22 @@ class Main(star.Star):
     ) -> tuple[str, str]:
         forward_context_text = self._get_forward_context_text(event)
         if forward_context_text:
+            origin = event.unified_msg_origin
+            current_msg_id = self._normalize_message_id(
+                getattr(event.message_obj, "message_id", "")
+            )
+            _, image_urls, image_cache_sources = self._format_event_message_body(event)
+            forward_context_text = await self._resolve_image_captions_for_text(
+                event,
+                cfg,
+                forward_context_text,
+                image_urls,
+                image_cache_sources,
+                origin=origin,
+                message_id=current_msg_id,
+            )
+            if forward_context_text:
+                self._replace_current_history_line_body(event, forward_context_text)
             return (
                 self._truncate_active_message_text(forward_context_text),
                 "forward_extra",
@@ -2103,6 +2259,22 @@ class Main(star.Star):
 
         forward_context_text = await self._parse_forward_context_current_message(event)
         if forward_context_text:
+            origin = event.unified_msg_origin
+            current_msg_id = self._normalize_message_id(
+                getattr(event.message_obj, "message_id", "")
+            )
+            _, image_urls, image_cache_sources = self._format_event_message_body(event)
+            forward_context_text = await self._resolve_image_captions_for_text(
+                event,
+                cfg,
+                forward_context_text,
+                image_urls,
+                image_cache_sources,
+                origin=origin,
+                message_id=current_msg_id,
+            )
+            if forward_context_text:
+                self._replace_current_history_line_body(event, forward_context_text)
             return (
                 self._truncate_active_message_text(forward_context_text),
                 "forward_parse_fallback",
@@ -2128,37 +2300,15 @@ class Main(star.Star):
                     )
 
         body, image_urls, image_cache_sources = self._format_event_message_body(event)
-        if body and image_urls and cfg.group_history.image_caption:
-            for image_idx, image_url in enumerate(image_urls):
-                cache_source = (
-                    image_cache_sources[image_idx]
-                    if image_idx < len(image_cache_sources)
-                    else ""
-                )
-                try:
-                    caption = await self._caption_image_with_cache(
-                        event,
-                        cfg,
-                        image_url=image_url,
-                        cache_source=cache_source,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "enhance-mode | active message image caption failed | "
-                        "origin=%s msg_id=%s image_index=%s error=%s",
-                        origin,
-                        current_msg_id,
-                        image_idx + 1,
-                        e,
-                    )
-                    continue
-                if not caption:
-                    continue
-                body, _ = self._replace_image_marker_at_index(
-                    body,
-                    image_idx,
-                    caption,
-                )
+        body = await self._resolve_image_captions_for_text(
+            event,
+            cfg,
+            body,
+            image_urls,
+            image_cache_sources,
+            origin=origin,
+            message_id=current_msg_id,
+        )
 
         if body:
             return self._truncate_active_message_text(body), "event_chain"
@@ -3295,6 +3445,11 @@ class Main(star.Star):
         trigger_reason: str,
     ) -> bool:
         ar = cfg.active_reply
+        messages = await self._resolve_image_captions_for_context_lines(
+            event,
+            cfg,
+            list(messages),
+        )
         history_limit = (
             min(ar.model_history_messages, ar.unified_context_messages)
             if ar.model_history_messages > 0

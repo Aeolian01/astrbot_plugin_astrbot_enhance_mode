@@ -104,6 +104,7 @@ def test_forward_context_api_retries_after_initial_import_failure(
 
     monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API", None)
     monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT", 0.0)
+    monkeypatch.setattr(main_module, "_find_loaded_forward_context_api", lambda: None)
     monkeypatch.setattr(main_module.importlib, "import_module", import_module)
 
     assert main_module._get_forward_context_api() is None
@@ -148,6 +149,9 @@ def test_forward_context_api_uses_loaded_public_api_when_import_path_missing(
     monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API", None)
     monkeypatch.setattr(main_module, "_FORWARD_CONTEXT_API_LAST_ERROR_LOG_AT", 0.0)
     monkeypatch.setattr(main_module.importlib, "import_module", import_module)
+    for module_name in list(main_module.sys.modules):
+        if "astrbot_plugin_forward_context" in module_name:
+            monkeypatch.delitem(main_module.sys.modules, module_name, raising=False)
     monkeypatch.setitem(
         main_module.sys.modules,
         "astrbot.core.plugins.local.forward_context.public_api",
