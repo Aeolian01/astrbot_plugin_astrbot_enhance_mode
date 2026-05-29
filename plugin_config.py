@@ -31,6 +31,9 @@ DEFAULT_WEB_SEARCH_SYSTEM_PROMPT = (
     "Keep content concise and evidence-backed. "
     "IMPORTANT: Do NOT use Markdown formatting in the content field - use plain text only."
 )
+DEFAULT_VIDEO_CAPTION_PROMPT = (
+    "请用简体中文简短描述这个视频，重点说明主要画面、动作、可见文字和关键信息。"
+)
 
 
 def _to_bool(value: Any, default: bool) -> bool:
@@ -85,6 +88,25 @@ def _parse_whitelist(value: Any) -> list[str]:
     return []
 
 
+def _to_str_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values: Any = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = []
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        result.append(text)
+        seen.add(text)
+    return result
+
+
 @dataclass(frozen=True)
 class GroupHistoryEnhancementConfig:
     enable: bool = False
@@ -94,6 +116,9 @@ class GroupHistoryEnhancementConfig:
     image_caption: bool = False
     image_caption_provider_id: str = ""
     image_caption_prompt: str = "Please describe the image using Chinese."
+    video_caption_provider_id: str = ""
+    video_caption_provider_ids: list[str] = field(default_factory=list)
+    video_caption_prompt: str = DEFAULT_VIDEO_CAPTION_PROMPT
 
 
 @dataclass(frozen=True)
@@ -129,6 +154,7 @@ class GlobalLruConfig:
 @dataclass(frozen=True)
 class GlobalTimeoutConfig:
     image_caption_sec: float = 45.0
+    video_caption_sec: float = 120.0
     model_choice_sec: float = 45.0
 
 
@@ -221,6 +247,18 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             group_history_raw.get("image_caption_prompt")
             or "Please describe the image using Chinese."
         ),
+        video_caption_provider_id=str(
+            group_history_raw.get("video_caption_provider_id")
+            or group_history_raw.get("image_caption_provider_id")
+            or ""
+        ),
+        video_caption_provider_ids=_to_str_list(
+            group_history_raw.get("video_caption_provider_ids")
+        ),
+        video_caption_prompt=str(
+            group_history_raw.get("video_caption_prompt")
+            or DEFAULT_VIDEO_CAPTION_PROMPT
+        ),
     )
 
     active_reply_raw = raw.get("active_reply", {})
@@ -260,6 +298,9 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         timeouts=GlobalTimeoutConfig(
             image_caption_sec=_to_pos_float(
                 timeouts_raw.get("image_caption_sec"), 45.0
+            ),
+            video_caption_sec=_to_pos_float(
+                timeouts_raw.get("video_caption_sec"), 120.0
             ),
             model_choice_sec=_to_pos_float(timeouts_raw.get("model_choice_sec"), 45.0),
         ),

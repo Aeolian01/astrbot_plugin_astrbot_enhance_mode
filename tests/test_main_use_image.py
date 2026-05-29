@@ -13,6 +13,7 @@ from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     GroupFeatureEnhancementConfig,
     GroupHistoryEnhancementConfig,
     PluginConfig,
+    WebSearchConfig,
 )
 from astrbot_plugin_astrbot_enhance_mode.runtime_state import RuntimeState
 
@@ -651,3 +652,280 @@ async def test_use_image_history_only_fails_when_caption_disabled_and_not_cached
         results[0].content[0].text
         == "Image caption is disabled in enhance mode config."
     )
+
+
+class _Video:
+    def __init__(self, url: str = "", file: str = "") -> None:
+        self.url = url
+        self.file = file
+
+
+class _Sender:
+    nickname = "Alice"
+
+
+class _MessageObj:
+    sender = _Sender()
+    message_id = "123"
+
+
+class _RecordEvent(_DummyEvent):
+    message_obj = _MessageObj()
+
+    def get_messages(self) -> list[object]:
+        return [_Video(url="https://example.com/video.mp4", file="video.mp4")]
+
+    def get_sender_id(self) -> str:
+        return "10001"
+
+    def is_admin(self) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_record_message_registers_video_source() -> None:
+    plugin, _event = _build_plugin(image_caption=False)
+    event = _RecordEvent("origin-1")
+
+    await plugin._record_message(event, plugin._cfg())
+
+    assert plugin.runtime.session_chats[event.unified_msg_origin][-1].endswith(
+        "#msg123: [Video]"
+    )
+    assert plugin.runtime.video_message_registry[event.unified_msg_origin]["123"][
+        "urls"
+    ] == ["https://example.com/video.mp4"]
+
+
+@pytest.mark.asyncio
+async def test_use_video_captions_and_writes_history() -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    plugin.runtime.session_chats[event.unified_msg_origin].append(
+        "[Alice/10001/12:00:00] #msg123: [Video]"
+    )
+    plugin.runtime.video_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/video.mp4"],
+        "captions": {},
+    }
+
+    async def caption_video(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return "A useful video caption"
+
+    plugin._caption_video_with_gemini = caption_video
+
+    results = []
+    async for item in plugin.use_video(event=event, message_id="123", video_index=1):
+        results.append(item)
+
+    payload = _payload_from_results(results)
+    assert payload["success"] is True
+    assert payload["result_type"] == "native_video_analysis"
+    assert payload["description"] == "A useful video caption"
+    assert payload["native_video_result"] == "A useful video caption"
+    assert payload["native_video_used"] is True
+    assert payload["native_video_question_specific"] is False
+    assert payload["write_to_history_success"] is True
+    assert plugin.runtime.session_chats[event.unified_msg_origin][-1].endswith(
+        "#msg123: [Video: A useful video caption]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_video_caption_helper_uses_configured_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    cfg = PluginConfig(
+        group_history=GroupHistoryEnhancementConfig(enable=True),
+        group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
+        global_settings=GlobalSettingsConfig(),
+        web_search=WebSearchConfig(proxy_url="http://sing-box:7890"),
+    )
+    provider = object()
+    plugin._resolve_video_caption_providers = lambda *_args, **_kwargs: [
+        ("p1", provider)
+    ]
+
+    async def caption_video(provider_arg, video_url, prompt, **kwargs):  # noqa: ANN001
+        assert provider_arg is provider
+        assert video_url == "https://example.com/video.mp4"
+        assert prompt
+        assert kwargs["proxy_url"] == "http://sing-box:7890"
+        return "A useful video caption"
+
+    monkeypatch.setattr(
+        main_module,
+        "caption_video_with_gemini_provider",
+        caption_video,
+    )
+
+    caption = await plugin._caption_video_with_gemini(
+        event,
+        cfg,
+        "https://example.com/video.mp4",
+    )
+
+    assert caption == "A useful video caption"
+
+
+class _VideoQuestionEvent(_DummyEvent):
+    def get_messages(self) -> list[object]:
+        return [main_module.Plain("解读一下这个视频是什么意思")]
+
+
+@pytest.mark.asyncio
+async def test_video_caption_helper_infers_current_video_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, _event = _build_plugin(image_caption=False)
+    event = _VideoQuestionEvent("origin-1")
+    cfg = PluginConfig(
+        group_history=GroupHistoryEnhancementConfig(enable=True),
+        group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
+        global_settings=GlobalSettingsConfig(),
+    )
+    provider = object()
+    captured: dict[str, str] = {}
+    plugin._resolve_video_caption_providers = lambda *_args, **_kwargs: [
+        ("p1", provider)
+    ]
+
+    async def caption_video(_provider, _video_url, prompt, **_kwargs):  # noqa: ANN001
+        captured["prompt"] = prompt
+        return "native answer"
+
+    monkeypatch.setattr(
+        main_module,
+        "caption_video_with_gemini_provider",
+        caption_video,
+    )
+
+    caption = await plugin._caption_video_with_gemini(
+        event,
+        cfg,
+        "https://example.com/video.mp4",
+    )
+
+    assert caption == "native answer"
+    assert "用户问题：解读一下这个视频是什么意思" in captured["prompt"]
+    assert "不要只说泛泛的画面描述" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_use_video_bypasses_generic_cache_for_specific_prompt() -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    plugin.runtime.session_chats[event.unified_msg_origin].append(
+        "[Alice/10001/12:00:00] #msg123: [Video: generic caption]"
+    )
+    plugin.runtime.video_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/video.mp4"],
+        "captions": {0: "generic caption"},
+    }
+    captured: dict[str, str] = {}
+
+    async def caption_video(*_args, **kwargs):  # noqa: ANN002, ANN003
+        captured["prompt"] = kwargs["prompt"]
+        return "specific native answer"
+
+    plugin._caption_video_with_gemini = caption_video
+
+    results = []
+    async for item in plugin.use_video(
+        event=event,
+        message_id="123",
+        video_index=1,
+        prompt="这个视频里的人在做什么？",
+    ):
+        results.append(item)
+
+    payload = _payload_from_results(results)
+    assert payload["success"] is True
+    assert payload["native_video_result"] == "specific native answer"
+    assert payload["native_video_question_specific"] is True
+    assert payload["description_cached"] is False
+    assert captured["prompt"] == "这个视频里的人在做什么？"
+    assert plugin.runtime.video_message_registry[event.unified_msg_origin]["123"][
+        "captions"
+    ][0] == "generic caption"
+
+
+@pytest.mark.asyncio
+async def test_video_caption_falls_back_to_next_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    cfg = PluginConfig(
+        group_history=GroupHistoryEnhancementConfig(enable=True),
+        group_features=GroupFeatureEnhancementConfig(react_mode_enable=True),
+        global_settings=GlobalSettingsConfig(),
+    )
+    provider_1 = object()
+    provider_2 = object()
+    plugin._resolve_video_caption_providers = lambda *_args, **_kwargs: [
+        ("p1", provider_1),
+        ("p2", provider_2),
+    ]
+    calls = []
+
+    async def caption_video(provider_arg, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        calls.append(provider_arg)
+        if provider_arg is provider_1:
+            raise main_module.GeminiVideoError("Gemini video caption failed: 503")
+        return "fallback caption"
+
+    monkeypatch.setattr(
+        main_module,
+        "caption_video_with_gemini_provider",
+        caption_video,
+    )
+
+    caption = await plugin._caption_video_with_gemini(
+        event,
+        cfg,
+        "https://example.com/video.mp4",
+    )
+
+    assert caption == "fallback caption"
+    assert calls == [provider_1, provider_2]
+
+
+@pytest.mark.asyncio
+async def test_use_video_returns_error_when_video_index_out_of_range() -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    plugin.runtime.video_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/video.mp4"],
+        "captions": {},
+    }
+
+    results = []
+    async for item in plugin.use_video(event=event, message_id="123", video_index=2):
+        results.append(item)
+
+    assert len(results) == 1
+    assert "`video_index` out of range" in results[0].content[0].text
+
+
+@pytest.mark.asyncio
+async def test_use_video_reports_caption_provider_error() -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    plugin.runtime.video_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/video.mp4"],
+        "captions": {},
+    }
+
+    async def caption_video(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("Provider is not Gemini")
+
+    plugin._caption_video_with_gemini = caption_video
+
+    results = []
+    async for item in plugin.use_video(
+        event=event,
+        message_id="123",
+        video_index=1,
+    ):
+        results.append(item)
+
+    payload = _payload_from_results(results)
+    assert payload["success"] is False
+    assert "Provider is not Gemini" in payload["error"]
