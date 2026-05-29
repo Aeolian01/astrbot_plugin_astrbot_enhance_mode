@@ -9,6 +9,9 @@ class RuntimeState:
         self.image_message_registry: dict[str, dict[str, dict[str, object]]] = (
             defaultdict(dict)
         )
+        self.video_message_registry: dict[str, dict[str, dict[str, object]]] = (
+            defaultdict(dict)
+        )
         self.origin_lru: OrderedDict[str, None] = OrderedDict()
 
     def _evict_origin_state(self, origin: str) -> None:
@@ -16,6 +19,7 @@ class RuntimeState:
         self.active_reply_stacks.pop(origin, None)
         self.active_reply_pending.pop(origin, None)
         self.image_message_registry.pop(origin, None)
+        self.video_message_registry.pop(origin, None)
 
     def touch_origin(self, origin: str, max_origins: int) -> None:
         if not origin:

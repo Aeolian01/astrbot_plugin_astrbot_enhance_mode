@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import hashlib
 import importlib
 import inspect
 import json
@@ -31,6 +32,11 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.io import download_image_by_url
 
 from .ban_control import BanStore, parse_duration_seconds
+from .gemini_video import (
+    GeminiVideoError,
+    caption_video_with_gemini_provider,
+    is_bad_video_caption,
+)
 from .memory_rag_store import MemoryRAGStore
 from .plugin_config import PluginConfig, parse_plugin_config
 from .runtime_state import RuntimeState
@@ -46,6 +52,7 @@ from .tag_utils import (
 from .webui import RAGWebUIServer
 
 IMAGE_MARKER_PATTERN = re.compile(r"\[Image(?:: [^\]]*)?\]")
+VIDEO_MARKER_PATTERN = re.compile(r"\[Video(?:: [^\]]*)?\]")
 MSG_ID_PATTERN = re.compile(r"#msg([^:]+):")
 FORWARD_CONTEXT_TEXT_KEY = "_forward_context_text"
 FORWARD_CONTEXT_FOUND_KEY = "_forward_context_found"
@@ -472,14 +479,45 @@ class Main(star.Star):
                 return line
         return ""
 
+    @staticmethod
+    def _component_is_video(comp: Any) -> bool:
+        comp_name = type(comp).__name__.strip().lower()
+        comp_type = str(
+            getattr(comp, "type", "")
+            or getattr(comp, "component_type", "")
+            or ""
+        ).strip().lower()
+        return "video" in comp_name or "video" in comp_type
+
+    @staticmethod
+    def _media_source_from_component(comp: Any, keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = ""
+            try:
+                value = (
+                    comp.get(key)
+                    if isinstance(comp, dict)
+                    else getattr(comp, key, "")
+                )
+            except Exception:
+                value = ""
+            clean = str(value or "").strip()
+            if clean:
+                return clean
+        return ""
+
     def _format_event_message_body(
-        self, event: AstrMessageEvent
-    ) -> tuple[str, list[str], list[str]]:
+        self, event: AstrMessageEvent, *, include_video: bool = False
+    ) -> tuple[str, list[str], list[str]] | tuple[
+        str, list[str], list[str], list[str], list[str]
+    ]:
         forward_context_text = self._get_forward_context_text(event)
 
         parts: list[str] = []
         image_urls: list[str] = []
         image_cache_sources: list[str] = []
+        video_urls: list[str] = []
+        video_cache_sources: list[str] = []
         for comp in event.get_messages():
             if isinstance(comp, Reply):
                 if forward_context_text:
@@ -503,6 +541,31 @@ class Main(star.Star):
                 image_cache_sources.append(image_cache_source or image_url)
                 if not forward_context_text:
                     parts.append(" [Image]")
+            elif self._component_is_video(comp):
+                video_url = self._media_source_from_component(
+                    comp,
+                    (
+                        "url",
+                        "video_url",
+                        "download_url",
+                        "src",
+                        "origin_url",
+                        "file",
+                        "path",
+                    ),
+                )
+                video_cache_source = self._media_source_from_component(
+                    comp,
+                    ("file_id", "fileid", "file", "url", "video_url", "path"),
+                )
+                if video_cache_source and not video_cache_source.startswith(
+                    ("fileid:", "http://", "https://", "file://", "/")
+                ):
+                    video_cache_source = f"fileid:{video_cache_source}"
+                video_urls.append(video_url or video_cache_source)
+                video_cache_sources.append(video_cache_source or video_url)
+                if not forward_context_text:
+                    parts.append(" [Video]")
             elif isinstance(comp, At):
                 if not forward_context_text:
                     parts.append(f" [At: {comp.name}]")
@@ -514,8 +577,12 @@ class Main(star.Star):
                     parts.append(fallback)
 
         if forward_context_text:
-            return forward_context_text, image_urls, image_cache_sources
-        return "".join(parts).strip(), image_urls, image_cache_sources
+            body = forward_context_text
+        else:
+            body = "".join(parts).strip()
+        if include_video:
+            return body, image_urls, image_cache_sources, video_urls, video_cache_sources
+        return body, image_urls, image_cache_sources
 
     @staticmethod
     def _format_unknown_message_component(
@@ -851,6 +918,44 @@ class Main(star.Star):
             return True
         return False
 
+    @staticmethod
+    def _replace_video_marker_at_index(
+        line: str, video_index: int, caption: str
+    ) -> tuple[str, bool]:
+        matches = list(VIDEO_MARKER_PATTERN.finditer(line))
+        if video_index >= len(matches):
+            return line, False
+
+        target = matches[video_index]
+        safe_caption = str(caption or "").strip().replace("]", ")")
+        replacement = f"[Video: {safe_caption}]"
+        new_line = line[: target.start()] + replacement + line[target.end() :]
+        return new_line, new_line != line
+
+    def _apply_video_caption_to_history(
+        self,
+        origin: str,
+        message_id: str,
+        video_index: int,
+        caption: str,
+    ) -> bool:
+        chats = self.runtime.session_chats.get(origin)
+        if not chats:
+            return False
+
+        target_marker = f"#msg{message_id}:"
+        for idx, line in enumerate(chats):
+            if target_marker not in line:
+                continue
+            replaced_line, changed = self._replace_video_marker_at_index(
+                line, video_index, caption
+            )
+            if not changed:
+                return False
+            chats[idx] = replaced_line
+            return True
+        return False
+
     def _replace_history_line_by_message_id(
         self, origin: str, message_id: str, new_line: str
     ) -> bool:
@@ -955,6 +1060,199 @@ class Main(star.Star):
             self.runtime.image_message_registry[origin][normalized_msg_id] = entry
             return entry
         return local_entry if isinstance(local_entry, dict) else {}
+
+    async def _get_video_message_entry(
+        self, origin: str, message_id: str
+    ) -> dict[str, Any]:
+        normalized_msg_id = self._normalize_message_id(message_id)
+        if not origin or not normalized_msg_id:
+            return {}
+        local_entry = self.runtime.video_message_registry.get(origin, {}).get(
+            normalized_msg_id
+        )
+        return local_entry if isinstance(local_entry, dict) else {}
+
+    def _resolve_video_caption_providers(
+        self, event: AstrMessageEvent, cfg: PluginConfig
+    ) -> list[tuple[str, Provider]]:
+        provider_ids: list[str] = []
+        seen: set[str] = set()
+
+        def add_provider_id(value: object) -> None:
+            provider_id = str(value or "").strip()
+            if provider_id and provider_id not in seen:
+                provider_ids.append(provider_id)
+                seen.add(provider_id)
+
+        for provider_id in getattr(cfg.group_history, "video_caption_provider_ids", []):
+            add_provider_id(provider_id)
+        if not provider_ids:
+            add_provider_id(cfg.group_history.video_caption_provider_id)
+            add_provider_id(cfg.group_history.image_caption_provider_id)
+
+        providers: list[tuple[str, Provider]] = []
+        for provider_id in provider_ids:
+            try:
+                provider = self.context.get_provider_by_id(provider_id)
+            except Exception as e:
+                logger.warning(
+                    "enhance-mode | video_caption_provider_id 读取失败: %s error=%s",
+                    provider_id,
+                    e,
+                )
+                continue
+            if provider and isinstance(provider, Provider):
+                providers.append((provider_id, provider))
+            else:
+                logger.warning(
+                    "enhance-mode | 配置的 video_caption_provider_id 无效或类型不匹配: %s",
+                    provider_id,
+                )
+
+        if providers:
+            return providers
+
+        if provider_ids:
+            return []
+
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        if provider and isinstance(provider, Provider):
+            return [("<using_provider>", provider)]
+        return []
+
+    def _resolve_video_caption_provider(
+        self, event: AstrMessageEvent, cfg: PluginConfig
+    ) -> Provider | None:
+        providers = self._resolve_video_caption_providers(event, cfg)
+        return providers[0][1] if providers else None
+
+    async def _caption_video_with_gemini(
+        self,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        video_url: str,
+        prompt: str = "",
+    ) -> str:
+        clean_video_url = str(video_url or "").strip()
+        if not clean_video_url:
+            return ""
+        providers = self._resolve_video_caption_providers(event, cfg)
+        if not providers:
+            raise GeminiVideoError("No LLM provider is available for video caption.")
+
+        final_prompt, _question_specific = self._build_video_analysis_prompt(
+            event,
+            cfg,
+            prompt,
+        )
+        last_error: Exception | None = None
+        for provider_id, provider in providers:
+            start_ts = time.perf_counter()
+            provider_label = self._provider_label(provider)
+            logger.info(
+                "enhance-mode | video_caption start | origin=%s provider=%s provider_id=%s video=%s",
+                event.unified_msg_origin,
+                provider_label,
+                provider_id,
+                clean_video_url,
+            )
+            try:
+                caption = await caption_video_with_gemini_provider(
+                    provider,
+                    clean_video_url,
+                    final_prompt,
+                    timeout_sec=cfg.global_settings.timeouts.video_caption_sec,
+                    proxy_url=str(cfg.web_search.proxy_url or "").strip(),
+                )
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "enhance-mode | video_caption provider failed | origin=%s provider=%s provider_id=%s error=%s",
+                    event.unified_msg_origin,
+                    provider_label,
+                    provider_id,
+                    e,
+                )
+                continue
+
+            caption = str(caption or "").strip().replace("\n", " ")
+            if is_bad_video_caption(caption):
+                logger.warning(
+                    "enhance-mode | video_caption ignored bad response | origin=%s provider=%s text=%s",
+                    event.unified_msg_origin,
+                    provider_label,
+                    caption,
+                )
+                last_error = GeminiVideoError(
+                    f"Provider `{provider_id}` returned a no-video response."
+                )
+                continue
+            if not caption:
+                last_error = GeminiVideoError(
+                    f"Provider `{provider_id}` returned an empty video caption."
+                )
+                continue
+
+            elapsed_ms = (time.perf_counter() - start_ts) * 1000
+            logger.info(
+                "enhance-mode | video_caption done | origin=%s provider=%s provider_id=%s elapsed_ms=%.1f caption_len=%s",
+                event.unified_msg_origin,
+                provider_label,
+                provider_id,
+                elapsed_ms,
+                len(caption),
+            )
+            return caption
+
+        if last_error is not None:
+            raise GeminiVideoError(f"All Gemini video caption providers failed. Last error: {last_error}") from last_error
+        return ""
+
+    def _build_video_analysis_prompt(
+        self,
+        event: AstrMessageEvent,
+        cfg: PluginConfig,
+        prompt: str = "",
+    ) -> tuple[str, bool]:
+        explicit_prompt = str(prompt or "").strip()
+        if explicit_prompt:
+            return explicit_prompt, True
+
+        current_text = ""
+        try:
+            formatted = self._format_event_message_body(event)
+            current_text = str(formatted[0] if formatted else "").strip()
+        except Exception:
+            current_text = ""
+        current_text = re.sub(r"\[Reply[^\]]*\]", " ", current_text).strip()
+        current_text = re.sub(r"\[At:[^\]]*\]", " ", current_text).strip()
+        if current_text and any(
+            keyword in current_text
+            for keyword in (
+                "视频",
+                "解读",
+                "分析",
+                "看看",
+                "看下",
+                "意思",
+                "是什么",
+                "发生",
+                "讲了",
+            )
+        ):
+            return (
+                "请直接观看这个视频，并用简体中文回答用户当前问题。"
+                "不要只说泛泛的画面描述；要结合视频内容回答问题。\n"
+                f"用户问题：{current_text}\n"
+                "如果问题没有指定细节，请说明主要画面、动作、可见文字和关键信息。",
+                True,
+            )
+
+        return (
+            cfg.group_history.video_caption_prompt
+            or cfg.group_history.image_caption_prompt,
+            False,
+        )
 
     async def _caption_image_with_cache(
         self,
@@ -1760,6 +2058,71 @@ class Main(star.Star):
         return []
 
     @staticmethod
+    def _extract_video_sources_from_history_content(content: Any) -> list[dict[str, str]]:
+        def pick_first(data: dict[str, Any], keys: tuple[str, ...]) -> str:
+            for key in keys:
+                value = data.get(key)
+                if value is None:
+                    continue
+                clean = str(value or "").strip()
+                if clean:
+                    return clean
+            return ""
+
+        def part_video_source(part: Any) -> dict[str, str] | None:
+            if not isinstance(part, dict):
+                return None
+
+            part_type = str(part.get("type") or part.get("role") or "").lower()
+            data = part.get("data") if isinstance(part.get("data"), dict) else part
+            if part_type not in {"video", "shortvideo"}:
+                return None
+
+            video_url = pick_first(
+                data,
+                (
+                    "url",
+                    "video_url",
+                    "src",
+                    "download_url",
+                    "origin_url",
+                    "file",
+                    "path",
+                ),
+            )
+            fileid = pick_first(data, ("fileid", "file_id"))
+            cache_source = f"fileid:{fileid}" if fileid else ""
+            if not cache_source:
+                cache_source = pick_first(
+                    data,
+                    ("file", "url", "video_url", "src", "path", "download_url"),
+                )
+            if not video_url and not cache_source:
+                return None
+            return {
+                "url": video_url or cache_source,
+                "cache_source": cache_source or video_url,
+            }
+
+        if isinstance(content, list):
+            return [
+                source
+                for source in (part_video_source(part) for part in content)
+                if source is not None
+            ]
+        if isinstance(content, dict):
+            message = content.get("message")
+            if isinstance(message, list):
+                return [
+                    source
+                    for source in (part_video_source(part) for part in message)
+                    if source is not None
+                ]
+            source = part_video_source(content)
+            return [source] if source is not None else []
+        return []
+
+    @staticmethod
     def _history_content_has_forward_context_payload(content: Any) -> bool:
         def check(value: Any) -> bool:
             if isinstance(value, str):
@@ -1887,6 +2250,66 @@ class Main(star.Star):
 
         return changed
 
+    def _register_history_video_sources(
+        self,
+        origin: str,
+        message_id: str,
+        video_urls: list[str],
+        cache_sources: list[str] | None = None,
+    ) -> bool:
+        normalized_msg_id = self._normalize_message_id(message_id)
+        if not normalized_msg_id or not video_urls:
+            return False
+
+        self._touch_origin(origin, self._cfg())
+        registry = self.runtime.video_message_registry[origin]
+        message_entry = registry.get(normalized_msg_id)
+        changed = False
+        if not isinstance(message_entry, dict) or not message_entry:
+            message_entry = {}
+            registry[normalized_msg_id] = message_entry
+            changed = True
+
+        urls = message_entry.get("urls")
+        if not isinstance(urls, list):
+            urls = []
+            message_entry["urls"] = urls
+            changed = True
+
+        stored_cache_sources = message_entry.get("cache_sources")
+        if not isinstance(stored_cache_sources, list):
+            stored_cache_sources = [str(url or "").strip() for url in urls]
+            message_entry["cache_sources"] = stored_cache_sources
+            changed = True
+
+        captions = message_entry.get("captions")
+        if not isinstance(captions, dict):
+            message_entry["captions"] = {}
+            changed = True
+
+        existing_keys = {
+            str(stored_cache_sources[idx] if idx < len(stored_cache_sources) else "")
+            or str(urls[idx] if idx < len(urls) else "")
+            for idx in range(max(len(urls), len(stored_cache_sources)))
+        }
+        cache_sources = cache_sources or []
+        for idx, video_url in enumerate(video_urls):
+            clean_url = str(video_url or "").strip()
+            cache_source = (
+                str(cache_sources[idx] or "").strip()
+                if idx < len(cache_sources)
+                else ""
+            )
+            key = cache_source or clean_url
+            if not key or key in existing_keys:
+                continue
+            urls.append(clean_url or key)
+            stored_cache_sources.append(cache_source or clean_url)
+            existing_keys.add(key)
+            changed = True
+
+        return changed
+
     async def _format_adapter_history_entry(
         self, event: AstrMessageEvent, message: Any
     ) -> dict[str, Any]:
@@ -1921,11 +2344,16 @@ class Main(star.Star):
         )
         timestamp = self._format_history_time(message.get("time") or message.get("timestamp"))
         image_sources = self._extract_image_sources_from_history_content(raw_parts)
+        video_sources = self._extract_video_sources_from_history_content(raw_parts)
         return {
             "line": f"[{sender_name}/{sender_id}/{timestamp}] #msg{message_id}: {text}",
             "message_id": message_id,
             "image_urls": [source["url"] for source in image_sources],
             "cache_sources": [source["cache_source"] for source in image_sources],
+            "video_urls": [source["url"] for source in video_sources],
+            "video_cache_sources": [
+                source["cache_source"] for source in video_sources
+            ],
         }
 
     @staticmethod
@@ -2164,6 +2592,12 @@ class Main(star.Star):
                     list(entry.get("image_urls") or []),
                     list(entry.get("cache_sources") or []),
                 )
+                self._register_history_video_sources(
+                    origin,
+                    message_id,
+                    list(entry.get("video_urls") or []),
+                    list(entry.get("video_cache_sources") or []),
+                )
 
         if not new_lines:
             return
@@ -2390,6 +2824,12 @@ class Main(star.Star):
             "By default it does both: attach image to this run context and write description back into chat history. "
             "Set `attach_to_model=false` for history-only. "
             "Set `write_to_history=false` for attach-only."
+            "\nIf a history message contains `[Video]` or `[Video: ...]` and video details are necessary, "
+            "you may call `enhance_use_video(message_id, video_index, write_to_history, prompt)`. "
+            "Pass the user's concrete video question in `prompt`; this tool uploads the video to Gemini native Files API "
+            "and asks the Gemini model to inspect the original video directly, not just produce a generic caption. "
+            "Use the returned `native_video_result` as the video-grounded answer; it writes that native video result "
+            "back into chat history by default."
         )
         if cfg.web_search.enable:
             interaction_instructions += (
@@ -3824,9 +4264,13 @@ class Main(star.Star):
         nickname = event.message_obj.sender.nickname
         msg_id = event.message_obj.message_id
         normalized_msg_id = self._normalize_message_id(msg_id)
-        message_body, image_urls, image_cache_sources = self._format_event_message_body(
-            event
-        )
+        (
+            message_body,
+            image_urls,
+            image_cache_sources,
+            video_urls,
+            video_cache_sources,
+        ) = self._format_event_message_body(event, include_video=True)
 
         if history_cfg.include_sender_id and history_cfg.include_role_tag:
             sender_id = event.get_sender_id()
@@ -3858,6 +4302,9 @@ class Main(star.Star):
                 self.runtime.image_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
+                self.runtime.video_message_registry[event.unified_msg_origin].pop(
+                    removed_msg_id, None
+                )
         if normalized_msg_id and image_urls:
             self.runtime.image_message_registry[event.unified_msg_origin][
                 normalized_msg_id
@@ -3872,6 +4319,20 @@ class Main(star.Star):
                 normalized_msg_id,
                 len(image_urls),
                 history_cfg.image_caption,
+            )
+        if normalized_msg_id and video_urls:
+            self.runtime.video_message_registry[event.unified_msg_origin][
+                normalized_msg_id
+            ] = {
+                "urls": video_urls,
+                "cache_sources": video_cache_sources,
+                "captions": {},
+            }
+            logger.debug(
+                "enhance-mode | video message registered | origin=%s msg_id=%s video_count=%s",
+                event.unified_msg_origin,
+                normalized_msg_id,
+                len(video_urls),
             )
         logger.debug(
             "enhance-mode | group history updated | origin=%s size=%s",
@@ -4048,6 +4509,9 @@ class Main(star.Star):
             removed_msg_id = self._extract_message_id_from_history_line(removed_line)
             if removed_msg_id:
                 self.runtime.image_message_registry[event.unified_msg_origin].pop(
+                    removed_msg_id, None
+                )
+                self.runtime.video_message_registry[event.unified_msg_origin].pop(
                     removed_msg_id, None
                 )
         logger.debug(
@@ -4534,6 +4998,214 @@ class Main(star.Star):
             index_number,
             attach_success,
             attach_requested,
+            history_success,
+            history_requested,
+            success,
+        )
+        yield self._make_text_tool_result(json.dumps(payload, ensure_ascii=False))
+
+    @llm_tool(name="enhance_use_video")
+    async def use_video(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        video_index: int = 1,
+        write_to_history: bool = True,
+        prompt: str = "",
+    ) -> AsyncGenerator[mcp_types.CallToolResult, None]:
+        """Upload one video from runtime history to Gemini and optionally backfill history.
+
+        Args:
+            message_id(string): Required. Message ID in history header, for example `123456`.
+            video_index(number): Optional. One-based index of video in that message. Default is 1.
+            write_to_history(bool): Optional. Replace `[Video]` with description in history. Default is true.
+            prompt(string): Optional. Concrete question/instruction for Gemini native video analysis.
+                Pass the user's current video question here when they ask for interpretation.
+        """
+        cfg = self._cfg()
+        if not cfg.group_history_enabled:
+            yield self._make_text_tool_result(
+                "Group history enhancement is disabled in enhance mode config."
+            )
+            return
+
+        normalized_message_id = self._normalize_message_id(message_id)
+        if not normalized_message_id:
+            yield self._make_text_tool_result("Invalid `message_id`: empty.")
+            return
+
+        try:
+            index_number = int(video_index)
+        except (TypeError, ValueError):
+            yield self._make_text_tool_result(
+                "Invalid `video_index`: must be a positive integer."
+            )
+            return
+        if index_number <= 0:
+            yield self._make_text_tool_result("Invalid `video_index`: must be >= 1.")
+            return
+        video_idx = index_number - 1
+
+        origin = event.unified_msg_origin
+        message_entry = await self._get_video_message_entry(
+            origin,
+            normalized_message_id,
+        )
+        if not isinstance(message_entry, dict) or not message_entry:
+            yield self._make_text_tool_result(
+                f"Video message `{normalized_message_id}` not found in current runtime history. "
+                "Try a newer message ID from current chat context."
+            )
+            return
+
+        urls_raw = message_entry.get("urls")
+        if not isinstance(urls_raw, list) or not urls_raw:
+            yield self._make_text_tool_result(
+                f"No video records found for message `{normalized_message_id}`."
+            )
+            return
+        if video_idx >= len(urls_raw):
+            yield self._make_text_tool_result(
+                f"`video_index` out of range. message `{normalized_message_id}` has "
+                f"{len(urls_raw)} video(s)."
+            )
+            return
+
+        video_url = str(urls_raw[video_idx] or "").strip()
+        if not video_url:
+            yield self._make_text_tool_result(
+                f"Video URL is unavailable for message `{normalized_message_id}` "
+                f"at index {index_number}."
+            )
+            return
+
+        captions_raw = message_entry.get("captions")
+        if isinstance(captions_raw, dict):
+            captions_map = captions_raw
+        else:
+            captions_map = {}
+            message_entry["captions"] = captions_map
+
+        analyses_raw = message_entry.get("analyses")
+        if isinstance(analyses_raw, dict):
+            analyses_map = analyses_raw
+        else:
+            analyses_map = {}
+            message_entry["analyses"] = analyses_map
+
+        analysis_prompt, question_specific = self._build_video_analysis_prompt(
+            event,
+            cfg,
+            prompt,
+        )
+        analysis_cache_key = hashlib.sha256(
+            f"{video_idx}\0{analysis_prompt}".encode("utf-8")
+        ).hexdigest()
+
+        caption = ""
+        caption_cached = False
+        if question_specific:
+            cached_caption = analyses_map.get(analysis_cache_key)
+        else:
+            cached_caption = captions_map.get(video_idx) or captions_map.get(
+                str(video_idx)
+            )
+        if isinstance(cached_caption, str) and cached_caption.strip():
+            caption = cached_caption.strip()
+            if is_bad_video_caption(caption):
+                if question_specific:
+                    analyses_map.pop(analysis_cache_key, None)
+                else:
+                    captions_map.pop(video_idx, None)
+                    captions_map.pop(str(video_idx), None)
+                caption = ""
+            else:
+                caption_cached = True
+
+        if not caption:
+            try:
+                caption = await self._caption_video_with_gemini(
+                    event,
+                    cfg,
+                    video_url=video_url,
+                    prompt=analysis_prompt,
+                )
+                caption = str(caption or "").strip()
+                if caption:
+                    if question_specific:
+                        analyses_map[analysis_cache_key] = caption
+                    else:
+                        captions_map[video_idx] = caption
+            except Exception as e:
+                logger.exception(
+                    "enhance-mode | use_video caption failed | origin=%s msg_id=%s video_index=%s error=%s",
+                    origin,
+                    normalized_message_id,
+                    index_number,
+                    e,
+                )
+                payload = {
+                    "status": "failed",
+                    "success": False,
+                    "origin": origin,
+                    "message_id": normalized_message_id,
+                    "video_index": index_number,
+                    "error": str(e),
+                }
+                yield self._make_text_tool_result(
+                    json.dumps(payload, ensure_ascii=False)
+                )
+                return
+
+        history_requested = bool(write_to_history)
+        history_success = False
+        history_error = ""
+        if history_requested:
+            if not caption:
+                history_error = "Video description is empty."
+            else:
+                history_success = self._apply_video_caption_to_history(
+                    origin=origin,
+                    message_id=normalized_message_id,
+                    video_index=video_idx,
+                    caption=caption,
+                )
+                if history_success:
+                    logger.info(
+                        "enhance-mode | use_video history write success | origin=%s msg_id=%s video_index=%s",
+                        origin,
+                        normalized_message_id,
+                        index_number,
+                    )
+                else:
+                    history_error = (
+                        "Failed to apply video description back to runtime history."
+                    )
+
+        success = bool(caption) and (history_success if history_requested else True)
+        payload: dict[str, object] = {
+            "status": "ok" if success else "failed",
+            "success": success,
+            "origin": origin,
+            "message_id": normalized_message_id,
+            "video_index": index_number,
+            "result_type": "native_video_analysis",
+            "description": caption,
+            "native_video_result": caption,
+            "native_video_used": bool(caption),
+            "native_video_question_specific": question_specific,
+            "description_cached": caption_cached,
+            "write_to_history_requested": history_requested,
+            "write_to_history_success": history_success if history_requested else None,
+        }
+        if history_error:
+            payload["write_to_history_error"] = history_error
+
+        logger.info(
+            "enhance-mode | use_video done | origin=%s msg_id=%s video_index=%s write=%s/%s success=%s",
+            origin,
+            normalized_message_id,
+            index_number,
             history_success,
             history_requested,
             success,

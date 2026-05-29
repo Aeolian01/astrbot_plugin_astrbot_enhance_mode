@@ -351,6 +351,17 @@ if importlib.util.find_spec("astrbot") is None:
             self.url = url
             self.file = file
 
+    class Video:
+        def __init__(
+            self,
+            url: str = "",
+            file: str = "",
+            video_url: str = "",
+        ) -> None:
+            self.url = url
+            self.file = file
+            self.video_url = video_url
+
     class Reply:
         def __init__(
             self,
@@ -400,6 +411,7 @@ if importlib.util.find_spec("astrbot") is None:
     message_components_mod.Image = Image
     message_components_mod.Plain = Plain
     message_components_mod.Reply = Reply
+    message_components_mod.Video = Video
     platform_mod.MessageType = MessageType
     provider_mod.LLMResponse = LLMResponse
     provider_mod.Provider = Provider

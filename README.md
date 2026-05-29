@@ -7,7 +7,7 @@
 
 ## 功能亮点
 
-- 面向群聊场景的 React 上下文增强，支持消息编号、角色标签、发送者 ID 与图片占位记录。
+- 面向群聊场景的 React 上下文增强，支持消息编号、角色标签、发送者 ID、图片与视频占位记录。
 - 主动回复支持概率触发与模型判定触发，并可为判定流程指定独立 Provider。
 - 被动回复、主动回复和 `model_choice` 判定共用同一套群聊历史上下文，统一由 enhance-mode 显式组装 prompt。
 - 支持 `<mention/>`、`<quote/>`、`<refuse/>` 控制标签，把模型输出转换为平台消息组件或主动取消发送。
@@ -24,6 +24,7 @@
 
 - 平台历史补齐注入时，若历史消息包含合并转发、嵌套转发、JSON/Ark 分享卡片，会调用 forward-context 公共解析 API 展开后再写入上下文。
 - 图片历史注入会优先复用 forward-context 的共享图片描述缓存，并把新解析结果写回共享缓存。
+- 视频历史会记录为 `[Video]`，模型需要解读时可调用 `enhance_use_video(...)`，由 Gemini 原生 Files API 上传视频后生成描述并写回历史。
 - 被动回复、active reply 正式回复和 `model_choice` 判定改为共用统一历史窗口，不再维护 model_choice 专用历史池。
 - `active_reply.seed_context_on_auto_create` 已移除；`auto_create_conversation` 仅表示是否自动创建空会话容器。
 
@@ -34,6 +35,7 @@
 - React 模式（群聊上下文增强总开关）
 - 群聊历史增强（可注入发送者 ID、角色标签、消息编号，并作为统一历史来源）
 - 图片转述（可选，历史先记录 `[Image]`，注入上下文时自动解析并回填历史）
+- 视频转述（历史先记录 `[Video]`，需要时通过 `enhance_use_video` 上传到 Gemini Files API 解析并回填历史）
 - 支持消费 `astrbot_plugin_forward_context` 写入的合并转发解析文本
 - 角色显示（在 system reminder 注入 `admin/member`）
 
@@ -65,6 +67,7 @@
 - LLM Tools:
   - `grok_web_search`
   - `enhance_use_image`
+  - `enhance_use_video`
   - `enhance_memory_rag_write`
   - `enhance_memory_rag_read`
 - Embedding Provider 独立配置（不是聊天模型 Provider）
@@ -150,6 +153,18 @@ event.get_extra("_forward_context_ids")
 - `auto_create_conversation` 现在只负责创建空会话，不再承担 seed 历史的职责。
 - 模型判定历史注入窗口统一由 `unified_context_messages` 控制。
 
+### `group_history_enhancement`
+
+图片和视频相关配置：
+
+- `image_caption_provider_id`：图片转述 Provider。
+- `image_caption_prompt`：图片转述提示词。
+- `video_caption_provider_id`：视频转述 Provider；为空时优先复用 `image_caption_provider_id`，仍为空则使用当前会话 Provider。
+- `video_caption_provider_ids`：视频转述 Provider 列表，按顺序尝试；遇到 Gemini 503/429、超时、空结果或坏响应时切换到下一个。非空时优先于单个 `video_caption_provider_id`。
+- `video_caption_prompt`：视频转述提示词，默认要求用简体中文简短描述主要画面、动作、可见文字和关键信息。
+
+超时配置位于 `global_settings.timeouts.video_caption_sec`，默认 `120` 秒。
+
 ## LLM Tools
 
 ### Ban Tools
@@ -162,8 +177,13 @@ event.get_extra("_forward_context_ids")
 
 - `grok_web_search(query)`
 - `enhance_use_image(...)`
+- `enhance_use_video(message_id, video_index=1, write_to_history=true, prompt="")`
 - `enhance_memory_rag_write(...)`
 - `enhance_memory_rag_read(...)`
+
+当历史里出现 `[Video]` 或 `[Video: ...]` 且用户要求“解读/分析/看看这个视频”时，模型应调用 `enhance_use_video`。`message_id` 使用历史中的 `#msg...` 编号，`video_index` 从 `1` 开始；`prompt` 应传入用户当前的具体视频问题。工具会把原视频上传到 Gemini 原生 Files API，让 Gemini 直接基于视频回答，而不是只做通用转述；同一个视频的通用描述不会被误用为新问题的答案。成功后返回 JSON，其中 `native_video_result` 是原生视频分析结果，并在 `write_to_history=true` 时把目标 `[Video]`/`[Video: ...]` 替换为 `[Video: 结果]`。
+
+当前视频工具只支持 Gemini / Google GenAI Provider。对 `google_gemini_openai/models/gemini-*` 这类 Provider，会把 OpenAI 兼容地址规范化为 Gemini 原生 `/v1beta` 与 `/upload/v1beta/files`，再上传视频并调用 `generateContent`。如果配置了 `web_search.proxy_url`，Gemini Files API 上传、轮询、生成和删除请求会复用该代理。Gemini `generateContent` 返回 503/429 时会短退避重试；如果配置了 `video_caption_provider_ids`，还会自动切换到下一个 Provider。非 Gemini Provider 会返回明确错误。
 
 ## Data Storage
 

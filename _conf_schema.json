@@ -46,6 +46,25 @@
                 "hint": "发送给图片转述模型的提示词。",
                 "type": "string",
                 "default": "Please describe the image using Chinese."
+            },
+            "video_caption_provider_id": {
+                "description": "视频转述提供商 ID",
+                "hint": "用于视频转述的 Gemini LLM 提供商 ID，留空时优先复用图片转述提供商。",
+                "type": "string",
+                "_special": "select_provider",
+                "default": ""
+            },
+            "video_caption_provider_ids": {
+                "description": "视频转述提供商 ID 列表",
+                "hint": "按顺序尝试多个 Gemini Provider。遇到 503/429、超时、空结果或坏响应时会切换到下一个。非空时优先于单个 video_caption_provider_id。",
+                "type": "list",
+                "default": []
+            },
+            "video_caption_prompt": {
+                "description": "视频转述提示词",
+                "hint": "发送给视频转述模型的提示词。",
+                "type": "string",
+                "default": "请用简体中文简短描述这个视频，重点说明主要画面、动作、可见文字和关键信息。"
             }
         }
     },
@@ -318,7 +337,7 @@
             },
             "timeouts": {
                 "description": "超时设置",
-                "hint": "外部模型调用超时（秒），用于图片转述与 model_choice 判定。",
+                "hint": "外部模型调用超时（秒），用于图片转述、视频转述与 model_choice 判定。",
                 "type": "object",
                 "items": {
                     "image_caption_sec": {
@@ -326,6 +345,12 @@
                         "hint": "图片转述调用 LLM 的超时时间。",
                         "type": "float",
                         "default": 45
+                    },
+                    "video_caption_sec": {
+                        "description": "视频转述超时(秒)",
+                        "hint": "视频上传和转述调用 Gemini 的总超时时间。",
+                        "type": "float",
+                        "default": 120
                     },
                     "model_choice_sec": {
                         "description": "模型判定超时(秒)",
