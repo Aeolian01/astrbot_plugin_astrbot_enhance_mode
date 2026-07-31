@@ -10,6 +10,7 @@ from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     GroupFeatureEnhancementConfig,
     PluginConfig,
 )
+from astrbot_plugin_astrbot_enhance_mode.runtime_state import RuntimeState
 
 
 class _DummyResult:
@@ -20,9 +21,17 @@ class _DummyResult:
 class _DummyDecoratingEvent:
     unified_msg_origin = "origin-dedupe"
 
-    def __init__(self, chain: list[object], active_reply: bool) -> None:
+    def __init__(
+        self,
+        chain: list[object],
+        active_reply: bool,
+        active_mode: str = "",
+    ) -> None:
         self.result = _DummyResult(chain)
-        self._extras = {"_enhance_active_reply_triggered": active_reply}
+        self._extras = {
+            "_enhance_active_reply_triggered": active_reply,
+            "_enhance_active_reply_mode": active_mode,
+        }
 
     def get_result(self) -> _DummyResult:
         return self.result
@@ -33,13 +42,17 @@ class _DummyDecoratingEvent:
     def get_extra(self, key: str, default: object = None) -> object:
         return self._extras.get(key, default)
 
+    def set_extra(self, key: str, value: object) -> None:
+        self._extras[key] = value
 
-def _build_plugin() -> Main:
+
+def _build_plugin(*, refuse_enable: bool = True) -> Main:
     plugin = Main.__new__(Main)
+    plugin.runtime = RuntimeState()
     plugin._cfg = lambda: PluginConfig(
         group_features=GroupFeatureEnhancementConfig(
             mention_parse=True,
-            refuse_enable=True,
+            refuse_enable=refuse_enable,
         )
     )
     return plugin
@@ -74,3 +87,20 @@ async def test_parse_tags_keeps_duplicate_chain_for_non_active_reply() -> None:
     await plugin.parse_tags(event)
 
     assert len(event.result.chain) == 4
+
+
+@pytest.mark.asyncio
+async def test_single_pass_refuse_is_silenced_even_if_global_toggle_is_off() -> None:
+    plugin = _build_plugin(refuse_enable=False)
+    event = _DummyDecoratingEvent(
+        [Plain(text="<refuse/>")],
+        active_reply=True,
+        active_mode="single_pass",
+    )
+    plugin.runtime.active_reply_pending[event.unified_msg_origin] = 1.0
+
+    await plugin.parse_tags(event)
+
+    assert event.result.chain == []
+    assert event.get_extra("_enhance_refused_reply") is True
+    assert event.unified_msg_origin not in plugin.runtime.active_reply_pending

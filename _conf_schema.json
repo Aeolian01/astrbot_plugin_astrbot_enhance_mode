@@ -81,7 +81,7 @@
             },
             "mode": {
                 "description": "触发模式",
-                "hint": "可选 probability（概率触发）或 model_choice（模型选择触发）。",
+                "hint": "可选 probability（概率触发）、model_choice（独立模型判定）或 single_pass（无模型消息栈，主模型一次完成判断和输出）。",
                 "type": "string",
                 "default": "probability"
             },
@@ -104,8 +104,8 @@
                 "default": 20
             },
             "model_stack_size": {
-                "description": "模型触发栈长度",
-                "hint": "当 mode=model_choice 时生效，累计到该条数后触发一次模型判定。",
+                "description": "累计消息数",
+                "hint": "当 mode=model_choice 或 single_pass 时生效。每个群独立累计；达到该条数后，model_choice 调用判定模型，single_pass 仅调用主模型一次完成判断和输出。最小为 1。",
                 "type": "int",
                 "default": 8
             },

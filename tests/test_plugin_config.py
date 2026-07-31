@@ -80,6 +80,20 @@ def test_active_reply_mode_and_limits_are_normalized() -> None:
     assert math.isclose(cfg.global_settings.timeouts.model_choice_sec, 45.0)
 
 
+def test_single_pass_mode_preserves_configurable_message_count() -> None:
+    cfg = parse_plugin_config(
+        {
+            "active_reply": {
+                "mode": "single_pass",
+                "model_stack_size": 5,
+            }
+        }
+    )
+
+    assert cfg.active_reply.mode == "single_pass"
+    assert cfg.active_reply.model_stack_size == 5
+
+
 def test_video_caption_provider_defaults_to_image_provider() -> None:
     cfg = parse_plugin_config(
         {

@@ -263,7 +263,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
 
     active_reply_raw = raw.get("active_reply", {})
     mode = str(active_reply_raw.get("mode", "probability")).strip().lower()
-    if mode not in {"probability", "model_choice"}:
+    if mode not in {"probability", "model_choice", "single_pass"}:
         mode = "probability"
     active_reply = ActiveReplyConfig(
         enable=_to_bool(active_reply_raw.get("enable"), False),
