@@ -1,6 +1,6 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.10`
+**Version**: `v0.2.11`
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、联网搜索与可视化 WebUI。
@@ -19,6 +19,12 @@
 - AstrBot 插件运行环境。
 - Python 依赖：`fastapi>=0.115.0`、`uvicorn>=0.30.0`，已在 `requirements.txt` 声明。
 - 可选增强：如需解析 QQ 合并转发、嵌套转发或 JSON 分享卡片，请同时安装 `astrbot_plugin_forward_context`。
+
+## Update Notes (v0.2.11)
+
+- 修复主动回复长提示词按“首尾截断”时把 `CURRENT_GROUP_MESSAGE` 裁掉的问题：超过上限时会固定保留当前消息、目标媒体清单和精简决策规则。
+- 对紧邻 `[Image]` 的短反问/反应，提示模型在因缺失视觉上下文而拒绝前先调用有界历史工具，并用 `write_to_history=false` 附加原图。
+- `image_caption=false` 时，`enhance_use_image` 的默认双模式不再阻止原图附加；历史回写会单独报告失败。
 
 ## Update Notes (v0.2.10)
 

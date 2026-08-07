@@ -10,6 +10,7 @@ import astrbot_plugin_astrbot_enhance_mode.main as main_module
 from astrbot_plugin_astrbot_enhance_mode.main import Main
 from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     ActiveReplyConfig,
+    ChatHistoryToolConfig,
     GroupFeatureEnhancementConfig,
     GroupHistoryEnhancementConfig,
     PluginConfig,
@@ -263,6 +264,57 @@ def test_single_pass_prompt_combines_decision_and_final_output() -> None:
     assert "#msg11" in prompt
     assert prompt.index("#msg10") < prompt.index("CURRENT_GROUP_MESSAGE_BEGIN")
     assert prompt.index("#msg11") > prompt.index("CURRENT_GROUP_MESSAGE_BEGIN")
+
+
+def test_single_pass_prompt_limit_pins_current_message_and_media_tools() -> None:
+    plugin = _build_plugin()
+    cfg = PluginConfig(
+        group_features=GroupFeatureEnhancementConfig(
+            react_mode_enable=True,
+            refuse_enable=True,
+        ),
+        group_history=GroupHistoryEnhancementConfig(enable=True),
+        active_reply=ActiveReplyConfig(
+            enable=True,
+            mode="single_pass",
+            pipeline_v2_enable=True,
+            enhancement_prompt_max_chars=3200,
+        ),
+        chat_history_tool=ChatHistoryToolConfig(enable=True),
+    )
+    current = "[见崎/2371469829] #msg279424572: 真的假的"
+    prompt = plugin._build_active_reply_prompt(
+        cfg,
+        {
+            "recent_history_lines": [
+                "[见崎/2371469829/23:05:31](member) #msg400054865: [Image]"
+            ],
+            "current_message_text": current,
+            "single_pass_messages": [current],
+            "single_pass_media_manifest": [],
+        },
+        active_mode="single_pass",
+    )
+
+    assert len(prompt) > cfg.active_reply.enhancement_prompt_max_chars
+    limited = plugin._limit_enhancement_prompt(
+        prompt,
+        cfg.active_reply.enhancement_prompt_max_chars,
+    )
+
+    assert len(limited) <= cfg.active_reply.enhancement_prompt_max_chars
+    assert "=== PINNED_CURRENT_CONTEXT_AFTER_TRUNCATION ===" in limited
+    assert limited.endswith("=== PINNED_CURRENT_CONTEXT_END ===")
+    assert "=== CURRENT_GROUP_MESSAGE_BEGIN ===" in limited
+    assert "=== CURRENT_GROUP_MESSAGE_END ===" in limited
+    assert "=== TARGET_MEDIA_MANIFEST_BEGIN ===" in limited
+    assert "=== TARGET_MEDIA_MANIFEST_END ===" in limited
+    assert current in limited
+    assert "#msg400054865: [Image]" in limited
+    assert "enhance_get_chat_history" in limited
+    assert "enhance_use_image" in limited
+    assert "write_to_history=false" in limited
+    assert "output exactly `<refuse/>`" in limited
 
 
 @pytest.mark.asyncio

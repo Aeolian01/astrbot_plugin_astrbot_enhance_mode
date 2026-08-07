@@ -209,6 +209,40 @@ async def test_use_image_attach_only_works_without_caption_enabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_use_image_default_mode_still_attaches_when_caption_disabled() -> None:
+    plugin, event = _build_plugin(image_caption=False)
+
+    async def should_not_be_called(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("caption provider must stay disabled")
+
+    async def resolve_local_path(_image_ref: str) -> str:
+        return "/tmp/fake-image.png"
+
+    plugin._get_image_caption = should_not_be_called
+    plugin._resolve_image_ref_to_local_path = resolve_local_path
+    plugin._encode_image_file = lambda _path: ("ZmFrZQ==", "image/png")
+    plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/image.png"],
+        "captions": {},
+    }
+
+    results = []
+    async for item in plugin.use_image(event=event, message_id="123", image_index=1):
+        results.append(item)
+
+    assert len(results) == 2
+    assert isinstance(results[0].content[0], mcp_types.ImageContent)
+    payload = _payload_from_results(results)
+    assert payload["success"] is False
+    assert payload["attach_success"] is True
+    assert payload["write_to_history_success"] is False
+    assert (
+        payload["write_to_history_error"]
+        == "Image caption is disabled in enhance mode config."
+    )
+
+
+@pytest.mark.asyncio
 async def test_use_image_can_use_forward_context_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
