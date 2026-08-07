@@ -1,13 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 
-import pytest
-from astrbot.api.message_components import Image, Plain
-from astrbot.api.platform import MessageType
-
 import astrbot_plugin_astrbot_enhance_mode.main as main_module
+import pytest
 from astrbot_plugin_astrbot_enhance_mode.main import Main
 from astrbot_plugin_astrbot_enhance_mode.plugin_config import (
     ActiveReplyConfig,
@@ -20,6 +18,9 @@ from astrbot_plugin_astrbot_enhance_mode.runtime_state import (
     PreparedMedia,
     RuntimeState,
 )
+
+from astrbot.api.message_components import Image, Plain
+from astrbot.api.platform import MessageType
 
 
 class _Result:
@@ -537,6 +538,131 @@ async def test_new_group_message_invalidates_pending_attempt_before_pending_skip
         attempt.attempt_id,
         target_message_id="m1",
     ) == (False, "newer_message")
+
+
+@pytest.mark.asyncio
+async def test_latest_wins_cancels_old_pipeline_and_runs_new_candidate() -> None:
+    cfg = _cfg(cooldown_sec=0, bot_density_max=3, cancel_on_newer_message=True)
+    plugin = _plugin(cfg)
+    first = _Event(message_id="m1", message_str="first")
+    second = _Event(message_id="m2", message_str="second")
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    never_finish = asyncio.Event()
+    evaluated: list[str] = []
+
+    async def record_noop(_event: _Event, _cfg: PluginConfig) -> None:
+        return None
+
+    async def need_active(event: _Event, _cfg: PluginConfig) -> bool:
+        message_id = str(event.message_obj.message_id)
+        evaluated.append(message_id)
+        if message_id != "m1":
+            return False
+        first_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+        return False
+
+    async def consume(event: _Event) -> None:
+        async for _item in plugin.on_group_message(event):
+            pass
+
+    plugin._record_message = record_noop
+    plugin._need_active_reply = need_active
+    old_task = asyncio.create_task(consume(first))
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        old_attempt = plugin.runtime.active_reply_attempts[first.unified_msg_origin]
+
+        await asyncio.wait_for(consume(second), timeout=1)
+        await asyncio.wait_for(first_cancelled.wait(), timeout=1)
+
+        assert old_task.cancelled()
+        assert evaluated == ["m1", "m2"]
+        assert plugin.runtime.validate_active_reply_attempt(
+            first.unified_msg_origin,
+            old_attempt.attempt_id,
+            target_message_id="m1",
+        ) == (False, "missing_attempt")
+        assert first.unified_msg_origin not in plugin.runtime.active_reply_pending
+        assert first.unified_msg_origin not in plugin.runtime.active_reply_attempts
+        assert getattr(plugin, "_active_reply_tasks", {}) == {}
+    finally:
+        if not old_task.done():
+            old_task.cancel()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_latest_wins_respects_cancel_on_newer_message_false() -> None:
+    cfg = _cfg(cooldown_sec=0, bot_density_max=3, cancel_on_newer_message=False)
+    plugin = _plugin(cfg)
+    first = _Event(message_id="m1", message_str="first")
+    second = _Event(message_id="m2", message_str="second")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    evaluated: list[str] = []
+
+    async def record_noop(_event: _Event, _cfg: PluginConfig) -> None:
+        return None
+
+    async def need_active(event: _Event, _cfg: PluginConfig) -> bool:
+        evaluated.append(str(event.message_obj.message_id))
+        first_started.set()
+        await release_first.wait()
+        return False
+
+    async def consume(event: _Event) -> None:
+        async for _item in plugin.on_group_message(event):
+            pass
+
+    plugin._record_message = record_noop
+    plugin._need_active_reply = need_active
+    old_task = asyncio.create_task(consume(first))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+
+    await asyncio.wait_for(consume(second), timeout=1)
+    assert not old_task.done()
+    assert evaluated == ["m1"]
+
+    release_first.set()
+    await asyncio.wait_for(old_task, timeout=1)
+    assert getattr(plugin, "_active_reply_tasks", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_active_reply_task_done_callback_cleans_abandoned_attempt() -> None:
+    cfg = _cfg()
+    plugin = _plugin(cfg)
+    event = _Event(message_id="crash", message_str="crash")
+    attempt_ready = asyncio.Event()
+
+    async def crashing_pipeline() -> None:
+        plugin.runtime.bump_generation(event.unified_msg_origin)
+        plugin._mark_active_reply_pending(
+            event.unified_msg_origin,
+            event=event,
+            cfg=cfg,
+        )
+        attempt_ready.set()
+        raise RuntimeError("simulated downstream failure")
+
+    task = asyncio.create_task(crashing_pipeline())
+    await asyncio.wait_for(attempt_ready.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match="simulated downstream failure"):
+        await task
+    await asyncio.sleep(0)
+
+    assert event.unified_msg_origin not in plugin.runtime.active_reply_pending
+    assert event.unified_msg_origin not in plugin.runtime.active_reply_attempts
+    assert getattr(plugin, "_active_reply_tasks", {}) == {}
 
 
 @pytest.mark.asyncio

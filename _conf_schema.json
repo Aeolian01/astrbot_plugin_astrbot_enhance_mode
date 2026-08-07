@@ -148,7 +148,7 @@
             },
             "cancel_on_newer_message": {
                 "description": "新消息取消旧回复",
-                "hint": "安全管线 v2 中，生成期间同群出现更新消息时取消旧主动回复。",
+                "hint": "安全管线 v2 中，生成期间同群出现更新消息时真实取消旧 pipeline task，并让最新消息继续参与主动回复判定。",
                 "type": "bool",
                 "default": true
             },

@@ -1,6 +1,6 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.9`
+**Version**: `v0.2.10`
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、联网搜索与可视化 WebUI。
@@ -19,6 +19,11 @@
 - AstrBot 插件运行环境。
 - Python 依赖：`fastapi>=0.115.0`、`uvicorn>=0.30.0`，已在 `requirements.txt` 声明。
 - 可选增强：如需解析 QQ 合并转发、嵌套转发或 JSON 分享卡片，请同时安装 `astrbot_plugin_forward_context`。
+
+## Update Notes (v0.2.10)
+
+- 修复 `cancel_on_newer_message` 只标记 generation、没有停止旧生成任务的问题：现在会按群绑定 AstrBot 的独立 pipeline task，新消息到达时比较清理旧 attempt 并真实取消旧任务。
+- latest-wins 取消会先释放旧 `pending`，让最新消息继续进入主动回复判定；generation 校验与发送前输出闸门仍保留为竞态兜底。
 
 ## Update Notes (v0.2.9)
 

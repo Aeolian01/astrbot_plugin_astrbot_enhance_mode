@@ -228,6 +228,7 @@ class Main(star.Star):
         self.config = config or {}
         self.runtime = RuntimeState()
         self._image_caption_inflight: dict[str, asyncio.Task[str]] = {}
+        self._active_reply_tasks: dict[str, tuple[str, asyncio.Task[Any]]] = {}
         self._display_timezone = self._resolve_config_timezone()
         plugin_data_dir = (
             Path(get_astrbot_data_path())
@@ -844,6 +845,102 @@ class Main(star.Star):
             return False
         return True
 
+    def _active_reply_task_registry(
+        self,
+    ) -> dict[str, tuple[str, asyncio.Task[Any]]]:
+        registry = getattr(self, "_active_reply_tasks", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            self._active_reply_tasks = registry
+        return registry
+
+    def _bind_active_reply_task(
+        self,
+        origin: str,
+        attempt_id: str,
+    ) -> None:
+        if not origin or not attempt_id:
+            return
+        task = asyncio.current_task()
+        if task is None:
+            return
+        binding = (attempt_id, task)
+        self._active_reply_task_registry()[origin] = binding
+
+        def release_finished_task(finished_task: asyncio.Task[Any]) -> None:
+            registry = getattr(self, "_active_reply_tasks", None)
+            if not isinstance(registry, dict):
+                return
+            if registry.get(origin) != (attempt_id, finished_task):
+                return
+            registry.pop(origin, None)
+            self.runtime.compare_and_clear_active_reply_attempt(origin, attempt_id)
+
+        task.add_done_callback(release_finished_task)
+
+    def _release_active_reply_task(
+        self,
+        origin: str,
+        attempt_id: str = "",
+    ) -> bool:
+        registry = self._active_reply_task_registry()
+        binding = registry.get(origin)
+        if binding is None:
+            return False
+        bound_attempt_id, _ = binding
+        if attempt_id and bound_attempt_id != attempt_id:
+            return False
+        registry.pop(origin, None)
+        return True
+
+    def _cancel_superseded_active_reply_task(
+        self,
+        origin: str,
+        cfg: PluginConfig,
+    ) -> bool:
+        if (
+            not origin
+            or not cfg.active_reply.pipeline_v2_enable
+            or not cfg.active_reply.cancel_on_newer_message
+        ):
+            return False
+
+        registry = self._active_reply_task_registry()
+        binding = registry.get(origin)
+        attempt = self.runtime.active_reply_attempts.get(origin)
+        if binding is None and attempt is None:
+            return False
+
+        bound_attempt_id = binding[0] if binding is not None else ""
+        bound_task = binding[1] if binding is not None else None
+        current_task = asyncio.current_task()
+        if bound_task is current_task:
+            return False
+
+        attempt_id = bound_attempt_id or (attempt.attempt_id if attempt else "")
+        if binding is not None and registry.get(origin) == binding:
+            registry.pop(origin, None)
+
+        state_cleared = (
+            self.runtime.compare_and_clear_active_reply_attempt(origin, attempt_id)
+            if attempt_id
+            else False
+        )
+        task_cancelled = False
+        if bound_task is not None and not bound_task.done():
+            bound_task.cancel("enhance-mode:latest-wins:newer-message")
+            task_cancelled = True
+
+        if state_cleared or task_cancelled:
+            logger.info(
+                "enhance-mode | active_reply latest-wins superseded | "
+                "origin=%s attempt=%s task_cancelled=%s",
+                origin,
+                attempt_id[:8] if attempt_id else "none",
+                task_cancelled,
+            )
+        return state_cleared or task_cancelled
+
     def _mark_active_reply_pending(
         self,
         origin: str,
@@ -868,6 +965,8 @@ class Main(star.Star):
         if attempt is not None and event is not None and hasattr(event, "set_extra"):
             event.set_extra(ENHANCE_ACTIVE_REPLY_ATTEMPT_ID_KEY, attempt.attempt_id)
             event.set_extra(ENHANCE_ACTIVE_REPLY_TARGET_ID_KEY, target_message_id)
+        if attempt is not None:
+            self._bind_active_reply_task(origin, attempt.attempt_id)
         return attempt
 
     def _clear_active_reply_pending(
@@ -886,12 +985,14 @@ class Main(star.Star):
                 or ""
             ).strip()
         if effective_attempt_id:
+            self._release_active_reply_task(origin, effective_attempt_id)
             self.runtime.compare_and_clear_active_reply_attempt(
                 origin,
                 effective_attempt_id,
             )
             return
         # Legacy path and pre-attempt failures.
+        self._release_active_reply_task(origin)
         self.runtime.active_reply_pending.pop(origin, None)
         self.runtime.active_reply_attempts.pop(origin, None)
 
@@ -5551,6 +5652,7 @@ class Main(star.Star):
         origin = event.unified_msg_origin
         if cfg.active_reply.pipeline_v2_enable:
             self.runtime.bump_generation(origin)
+            self._cancel_superseded_active_reply_task(origin, cfg)
 
         forward_context_text = self._get_forward_context_text(event)
         event_body, _, _ = self._format_event_message_body(event)
@@ -6281,6 +6383,7 @@ class Main(star.Star):
                     origin,
                     attempt_id,
                 ):
+                    self._release_active_reply_task(origin, attempt_id)
                     pending_text = str(
                         self._get_extra_value(
                             event,
