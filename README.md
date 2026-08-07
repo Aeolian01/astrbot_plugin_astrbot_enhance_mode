@@ -1,6 +1,6 @@
 # AstrBot Enhance Mode
 
-**Version**: `v0.2.7`  
+**Version**: `v0.2.9`
 **Author**: `阿汐`
 
 `astrbot_plugin_astrbot_enhance_mode` 是 AstrBot 的群聊增强插件，提供 React 群聊上下文、主动回复、标签解析、封禁控制、Memory RAG、联网搜索与可视化 WebUI。
@@ -8,7 +8,7 @@
 ## 功能亮点
 
 - 面向群聊场景的 React 上下文增强，支持消息编号、角色标签、发送者 ID、图片与视频占位记录。
-- 主动回复支持概率触发与模型判定触发，并可为判定流程指定独立 Provider。
+- 主动回复支持概率触发、模型判定触发和单次主模型判定/回复，并可为模型判定流程指定独立 Provider。
 - 被动回复、主动回复和 `model_choice` 判定共用同一套群聊历史上下文，统一由 enhance-mode 显式组装 prompt。
 - 支持 `<mention/>`、`<quote/>`、`<refuse/>` 控制标签，把模型输出转换为平台消息组件或主动取消发送。
 - 提供 Bot 侧封禁控制、可检索长期记忆、联网搜索工具与记忆管理 WebUI。
@@ -19,6 +19,17 @@
 - AstrBot 插件运行环境。
 - Python 依赖：`fastapi>=0.115.0`、`uvicorn>=0.30.0`，已在 `requirements.txt` 声明。
 - 可选增强：如需解析 QQ 合并转发、嵌套转发或 JSON 分享卡片，请同时安装 `astrbot_plugin_forward_context`。
+
+## Update Notes (v0.2.9)
+
+- 新增通用 `enhance_get_chat_history` 工具：模型可在当前上下文不足时，自主按 `recent`、`before` 或 `around` 有界读取当前 QQ 群历史。
+- 历史工具只从当前事件确定群号，不接受任意群号或 OneBot action；支持不透明分页游标、媒体句柄和结果净化，并可按群白名单关闭。
+- 封禁管理工具补充服务端实时管理员校验，不能由聊天历史中的文字伪造权限。
+
+## Update Notes (v0.2.8)
+
+- `single_pass` 在正式请求前会预处理图片；单张图片失败时最多尝试 3 次，成功后转为稳定的 `data:image/...` 再交给 AstrBot，避免 QQ CDN 瞬时异常导致模型只看到 `[Image]`。
+- 多张图片最多并发预处理 4 张；某张图片连续失败只会丢弃该图，不影响其余图片和文字回复。
 
 ## Update Notes (v0.2.7)
 
@@ -43,6 +54,7 @@
 
 - `probability` 概率触发
 - `model_choice` 模型判定触发（支持人格面具占位符）
+- `single_pass` 无分类模型消息栈；达到配置条数后，由主模型在一次调用中决定是否插话并直接生成最终回复
 - 白名单控制（按 `unified_msg_origin` 或群号）
 - 可自动创建缺失的 AstrBot 对话，但不会再向新会话自动 seed 最近群聊上下文
 - `model_choice` 判定历史不足时可通过平台适配器查询 QQ 群最新历史进行补齐
@@ -66,6 +78,7 @@
 
 - LLM Tools:
   - `grok_web_search`
+  - `enhance_get_chat_history`
   - `enhance_use_image`
   - `enhance_use_video`
   - `enhance_memory_rag_write`
@@ -127,6 +140,7 @@ event.get_extra("_forward_context_ids")
 - `group_features`
 - `group_history_enhancement`
 - `active_reply`
+- `chat_history_tool`
 - `web_search`
 - `memory_rag`
 - `memory_rag_webui`
@@ -137,11 +151,11 @@ event.get_extra("_forward_context_ids")
 当前重点配置项：
 
 - `enable`：启用主动回复
-- `mode`：`probability` 或 `model_choice`
-- `possibility`：概率触发时生效
+- `mode`：`probability`、`model_choice` 或 `single_pass`
+- `possibility`：概率模式的触发概率；安全管线 v2 下也作为 `model_choice` / `single_pass` 的前置 canary 硬采样上限
 - `auto_create_conversation`：主动回复触发但当前群没有 AstrBot 对话时，自动创建并切换到新会话
 - `unified_context_messages`：被动回复、主动回复与模型判定最多注入多少条统一群聊历史；`0` 表示不注入历史但仍记录历史
-- `model_stack_size`：`model_choice` 触发栈长度
+- `model_stack_size`：`model_choice` 或 `single_pass` 的触发栈长度
 - `model_history_messages`：`model_choice` 从统一历史中额外附带的判定历史条数；`0` 表示不附带，也不触发平台历史补足
 - `model_choice_provider_id`：判定模型提供商 ID
 - `model_choice_prompt`：判定提示词，支持占位符
@@ -165,6 +179,23 @@ event.get_extra("_forward_context_ids")
 
 超时配置位于 `global_settings.timeouts.video_caption_sec`，默认 `120` 秒。
 
+### `chat_history_tool`
+
+`enhance_get_chat_history(mode="recent", limit=8, anchor_message_id="", cursor="")`
+允许模型在当前可见上下文不足时，从触发本轮模型调用的同一 QQ 群按需读取有限历史：
+
+- `recent`：读取当前入站消息之前的最近消息。
+- `before`：读取已经验证属于当前群的指定消息之前的内容。
+- `around`：读取指定消息附近的上下文，但不会越过当前入站消息。
+- `cursor`：使用工具返回的一次性不透明游标继续读取一页更早历史。
+
+工具不接受群号、用户号或 OneBot action 参数；群号只从当前事件取得，并受
+`allowed_group_ids` 白名单限制。私聊和全库关键词搜索不受支持。历史结果会标为不可信数据，
+不返回 NapCat 原始载荷、QQ CDN URL、本地路径或发送者 QQ 号。
+
+图片和视频只返回当前会话媒体句柄。模型确实需要视觉细节时，再使用相同
+`message_id` 与从 1 开始的媒体索引调用 `enhance_use_image` / `enhance_use_video`。
+
 ## LLM Tools
 
 ### Ban Tools
@@ -173,9 +204,12 @@ event.get_extra("_forward_context_ids")
 2. `enhance_ban_user(user_id, duration="10m")`
 3. `enhance_unban_user(user_id)`
 
+三项封禁工具都会在服务端检查当前实时请求发送者的管理员身份；聊天历史中的文字不能授予权限。
+
 ### Other Tools
 
 - `grok_web_search(query)`
+- `enhance_get_chat_history(mode="recent", limit=8, anchor_message_id="", cursor="")`
 - `enhance_use_image(...)`
 - `enhance_use_video(message_id, video_index=1, write_to_history=true, prompt="")`
 - `enhance_memory_rag_write(...)`

@@ -87,7 +87,7 @@
             },
             "possibility": {
                 "description": "回复概率",
-                "hint": "当 mode=probability 时生效，范围建议 0.0 - 1.0。",
+                "hint": "范围 0.0 - 1.0。mode=probability 时直接决定触发概率；安全管线 v2 下的 model_choice/single_pass 也会先按此概率做 canary 硬采样，再进入后续判定。",
                 "type": "float",
                 "default": 0.1
             },
@@ -133,6 +133,84 @@
                 "hint": "英文逗号分隔的 unified_msg_origin 或群 ID。留空表示所有群可触发。",
                 "type": "string",
                 "default": ""
+            },
+            "pipeline_v2_enable": {
+                "description": "启用安全管线 v2",
+                "hint": "启用当前消息单目标、图片清单、过期取消、上下文保留与输出闸门。默认关闭以兼容既有部署；验证后再灰度开启。",
+                "type": "bool",
+                "default": false
+            },
+            "reply_max_age_sec": {
+                "description": "主动回复最大时效(秒)",
+                "hint": "安全管线 v2 中，从开始判定到发送允许经过的最长时间。超时回复会取消。",
+                "type": "float",
+                "default": 15
+            },
+            "cancel_on_newer_message": {
+                "description": "新消息取消旧回复",
+                "hint": "安全管线 v2 中，生成期间同群出现更新消息时取消旧主动回复。",
+                "type": "bool",
+                "default": true
+            },
+            "preserved_context_rounds": {
+                "description": "保留提供商上下文轮次",
+                "hint": "注入增强提示时保留最近多少个完整用户轮次；工具调用与结果、多模态内容保持原结构。",
+                "type": "int",
+                "default": 2
+            },
+            "enhancement_prompt_max_chars": {
+                "description": "增强提示最大字符数",
+                "hint": "安全管线 v2 中群聊历史与增强说明合计的字符预算，最小 1000。",
+                "type": "int",
+                "default": 3200
+            },
+            "output_gate_enable": {
+                "description": "启用主动回复输出闸门",
+                "hint": "拦截空正文、过程泄漏、过长、多段与过期的主动回复。",
+                "type": "bool",
+                "default": true
+            },
+            "active_reply_max_chars": {
+                "description": "主动闲聊最大字符数",
+                "hint": "安全管线 v2 的主动回复正文上限；超出时取消而不是截断。",
+                "type": "int",
+                "default": 50
+            },
+            "block_process_leak": {
+                "description": "拦截模型过程话术",
+                "hint": "拦截 I will、Let me、我将、接下来我会等工具或内部处理过程泄漏。",
+                "type": "bool",
+                "default": true
+            },
+            "require_single_sendable_chain": {
+                "description": "限制单一可发送正文",
+                "hint": "主动回复仅允许一段可发送正文，阻止模型拆成多段消息。",
+                "type": "bool",
+                "default": true
+            },
+            "unsolicited_image_reply": {
+                "description": "允许主动回复图片",
+                "hint": "关闭时，未被 @ 或引用的主动回复不会对含图片消息插话。建议保持关闭。",
+                "type": "bool",
+                "default": false
+            },
+            "cooldown_sec": {
+                "description": "主动回复冷却(秒)",
+                "hint": "仅在上一条主动回复确认发送成功后开始计算；发送失败或被闸门拦截不更新。",
+                "type": "float",
+                "default": 300
+            },
+            "bot_density_window": {
+                "description": "机器人密度窗口",
+                "hint": "检查最近多少条统一群聊历史中的机器人回复数量。",
+                "type": "int",
+                "default": 20
+            },
+            "bot_density_max": {
+                "description": "机器人密度上限",
+                "hint": "窗口内已有达到该数量的机器人回复时，不再主动插话。0 表示所有主动回复均被密度门控。",
+                "type": "int",
+                "default": 3
             }
         }
     },
@@ -182,6 +260,67 @@
                 "hint": "关闭时，AstrBot 内部判定为 role=admin 的用户不会被封禁工具封禁。",
                 "type": "bool",
                 "default": false
+            }
+        }
+    },
+    "chat_history_tool": {
+        "description": "当前群聊历史工具",
+        "hint": "允许模型在当前可见上下文不足时，按需读取触发本轮回复的同一 QQ 群历史。工具只读，不能由模型指定其他群。",
+        "type": "object",
+        "items": {
+            "enable": {
+                "description": "启用",
+                "hint": "开启 enhance_get_chat_history。必须同时配置允许群号；空白名单会拒绝所有调用。",
+                "type": "bool",
+                "default": false
+            },
+            "allowed_group_ids": {
+                "description": "允许群号",
+                "hint": "仅允许读取触发当前模型轮次的同一群聊；模型无法覆盖这里的群号。支持列表或逗号分隔字符串。",
+                "type": "list",
+                "default": []
+            },
+            "default_limit": {
+                "description": "默认返回条数",
+                "hint": "模型未指定 limit 时使用的消息数量。",
+                "type": "int",
+                "default": 8
+            },
+            "max_limit": {
+                "description": "单次最大条数",
+                "hint": "单次工具调用最多返回多少条消息，硬上限为 50。",
+                "type": "int",
+                "default": 20
+            },
+            "max_pages_per_turn": {
+                "description": "每轮最大调用次数",
+                "hint": "同一入站消息触发的模型轮次最多读取几页，硬上限为 4。",
+                "type": "int",
+                "default": 2
+            },
+            "max_messages_per_turn": {
+                "description": "每轮最大消息数",
+                "hint": "同一模型轮次所有历史工具调用累计最多返回多少条消息。",
+                "type": "int",
+                "default": 24
+            },
+            "max_output_chars": {
+                "description": "最大输出字符数",
+                "hint": "限制单次工具结果大小，超出时截断正文或较早消息。",
+                "type": "int",
+                "default": 8192
+            },
+            "cursor_ttl_sec": {
+                "description": "游标有效期(秒)",
+                "hint": "分页游标绑定当前群和当前入站消息，过期或使用一次后失效。",
+                "type": "float",
+                "default": 60
+            },
+            "api_timeout_sec": {
+                "description": "NapCat 调用超时(秒)",
+                "hint": "单次只读 OneBot API 调用的超时时间。",
+                "type": "float",
+                "default": 3
             }
         }
     },

@@ -259,6 +259,7 @@ if importlib.util.find_spec("astrbot") is None:
     utils_mod = types.ModuleType("astrbot.core.utils")
     astrbot_path_mod = types.ModuleType("astrbot.core.utils.astrbot_path")
     io_mod = types.ModuleType("astrbot.core.utils.io")
+    media_utils_mod = types.ModuleType("astrbot.core.utils.media_utils")
 
     class _Logger:
         def debug(self, *args, **kwargs):
@@ -398,6 +399,13 @@ if importlib.util.find_spec("astrbot") is None:
     async def download_image_by_url(url: str) -> str:
         return url
 
+    class MediaResolver:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def to_base64_data(self, **_kwargs):
+            raise AssertionError("MediaResolver must be replaced by the test")
+
     api_mod.logger = _Logger()
     api_mod.llm_tool = llm_tool
     api_mod.sp = _SP()
@@ -422,6 +430,7 @@ if importlib.util.find_spec("astrbot") is None:
     core_provider_provider_mod.EmbeddingProvider = EmbeddingProvider
     astrbot_path_mod.get_astrbot_data_path = get_astrbot_data_path
     io_mod.download_image_by_url = download_image_by_url
+    media_utils_mod.MediaResolver = MediaResolver
 
     sys.modules.update(
         {
@@ -441,5 +450,6 @@ if importlib.util.find_spec("astrbot") is None:
             "astrbot.core.utils": utils_mod,
             "astrbot.core.utils.astrbot_path": astrbot_path_mod,
             "astrbot.core.utils.io": io_mod,
+            "astrbot.core.utils.media_utils": media_utils_mod,
         }
     )

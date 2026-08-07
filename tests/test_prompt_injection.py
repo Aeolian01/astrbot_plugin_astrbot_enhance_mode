@@ -350,15 +350,177 @@ async def test_single_pass_image_stack_does_not_call_caption_model(
     async def caption_path_must_not_run(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("single_pass stack must not invoke image captioning")
 
+    async def preprocess_image_urls(image_urls: list[str]) -> list[str]:
+        assert image_urls == [
+            "https://example.com/forward.png",
+            "https://example.com/image.png",
+        ]
+        return ["data:image/png;base64,cHJlcGFyZWQ="]
+
     plugin._resolve_active_current_message_text = caption_path_must_not_run
+    plugin._preprocess_single_pass_image_urls = preprocess_image_urls
     event = ImageEvent()
+    event.set_extra(
+        "_forward_context_image_urls",
+        [
+            "https://example.com/forward.png",
+            "https://example.com/image.png",
+        ],
+    )
 
     assert await plugin._need_active_reply_single_pass(event, cfg) is True
     messages = event.get_extra(main_module.ENHANCE_SINGLE_PASS_STACK_KEY)
     assert isinstance(messages, list)
     assert messages == ["[Alice/10001] #msgimage-stack-1: [Image]"]
     assert event.get_extra(main_module.ENHANCE_SINGLE_PASS_IMAGE_URLS_KEY) == [
-        "https://example.com/image.png"
+        "data:image/png;base64,cHJlcGFyZWQ="
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_pass_image_preprocess_retries_until_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    attempts = 0
+
+    class ResolvedImage:
+        @staticmethod
+        def to_data_url() -> str:
+            return "data:image/jpeg;base64,aW1hZ2U="
+
+    class RetryingMediaResolver:
+        def __init__(self, image_ref: str, *, media_type: str) -> None:
+            assert image_ref == "https://example.com/retry.jpg"
+            assert media_type == "image"
+
+        async def to_base64_data(self, *, strict: bool):
+            nonlocal attempts
+            assert strict is True
+            attempts += 1
+            if attempts < 3:
+                raise OSError("transient download failure")
+            return ResolvedImage()
+
+    monkeypatch.setattr(main_module, "MediaResolver", RetryingMediaResolver)
+    monkeypatch.setattr(
+        main_module,
+        "SINGLE_PASS_IMAGE_PREPROCESS_RETRY_DELAY_SEC",
+        0,
+    )
+
+    prepared = await plugin._preprocess_single_pass_image_urls(
+        ["https://example.com/retry.jpg"]
+    )
+
+    assert attempts == main_module.SINGLE_PASS_IMAGE_PREPROCESS_ATTEMPTS
+    assert prepared == ["data:image/jpeg;base64,aW1hZ2U="]
+
+
+@pytest.mark.asyncio
+async def test_single_pass_image_preprocess_drops_only_failed_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _build_plugin()
+    attempts: dict[str, int] = {}
+
+    class ResolvedImage:
+        def __init__(self, payload: str) -> None:
+            self.payload = payload
+
+        def to_data_url(self) -> str:
+            return f"data:image/png;base64,{self.payload}"
+
+    class PartialMediaResolver:
+        def __init__(self, image_ref: str, *, media_type: str) -> None:
+            self.image_ref = image_ref
+            assert media_type == "image"
+
+        async def to_base64_data(self, *, strict: bool):
+            assert strict is True
+            attempts[self.image_ref] = attempts.get(self.image_ref, 0) + 1
+            if self.image_ref.endswith("bad.png"):
+                return None
+            return ResolvedImage("Z29vZA==")
+
+    monkeypatch.setattr(main_module, "MediaResolver", PartialMediaResolver)
+    monkeypatch.setattr(
+        main_module,
+        "SINGLE_PASS_IMAGE_PREPROCESS_RETRY_DELAY_SEC",
+        0,
+    )
+
+    prepared = await plugin._preprocess_single_pass_image_urls(
+        [
+            "https://example.com/bad.png",
+            "https://example.com/good.png",
+        ]
+    )
+
+    assert attempts["https://example.com/bad.png"] == 3
+    assert attempts["https://example.com/good.png"] == 1
+    assert prepared == ["data:image/png;base64,Z29vZA=="]
+
+
+@pytest.mark.asyncio
+async def test_single_pass_collects_forward_images_from_earlier_stack_message() -> None:
+    plugin = _build_plugin()
+    event = _DummyForwardEvent()
+    messages = [
+        "[Bob/2] #msg10: [Forward] [Image]",
+        "[Alice/1] #msg11: 帮我看看上一条",
+    ]
+
+    async def get_image_entry(_origin: str, message_id: str) -> dict[str, object]:
+        if message_id == "10":
+            return {"urls": ["https://example.com/earlier-forward.png"]}
+        return {}
+
+    plugin._get_image_message_entry = get_image_entry
+
+    image_urls = await plugin._collect_single_pass_image_urls(event, messages)
+
+    assert image_urls == ["https://example.com/earlier-forward.png"]
+
+
+@pytest.mark.asyncio
+async def test_single_pass_image_order_follows_stack_and_has_global_limit() -> None:
+    plugin = _build_plugin()
+    event = _DummyForwardEvent()
+    event.set_extra(
+        main_module.FORWARD_CONTEXT_IMAGE_URLS_KEY,
+        ["https://example.com/current-forward.png"],
+    )
+    messages = [
+        "[Bob/2] #msg10: [Forward] [Image]",
+        "[Alice/1] #msgfwd-1: 帮我看看这些图",
+    ]
+    earlier_urls = [
+        f"https://example.com/earlier-{idx}.png" for idx in range(20)
+    ]
+
+    async def get_image_entry(_origin: str, message_id: str) -> dict[str, object]:
+        if message_id == "10":
+            return {"urls": earlier_urls}
+        if message_id == "fwd-1":
+            return {"urls": ["https://example.com/current-registry.png"]}
+        return {}
+
+    plugin._get_image_message_entry = get_image_entry
+    plugin._format_event_message_body = lambda _event: (
+        "",
+        ["https://example.com/current-direct.png"],
+        [],
+    )
+
+    image_urls = await plugin._collect_single_pass_image_urls(event, messages)
+
+    assert len(image_urls) == main_module.MAX_SINGLE_PASS_IMAGE_URLS
+    assert image_urls == [
+        *earlier_urls[3:],
+        "https://example.com/current-registry.png",
+        "https://example.com/current-forward.png",
+        "https://example.com/current-direct.png",
     ]
 
 
@@ -550,8 +712,13 @@ async def test_single_pass_full_handler_yields_one_multimodal_main_request(
     ) -> tuple[str, object]:
         return "conversation-1", object()
 
+    async def preprocess_image_urls(image_urls: list[str]) -> list[str]:
+        assert image_urls == ["https://example.com/direct.png"]
+        return ["data:image/png;base64,ZGlyZWN0"]
+
     plugin.context = Context()
     plugin._ensure_active_reply_conversation = ensure_conversation
+    plugin._preprocess_single_pass_image_urls = preprocess_image_urls
     event = ImageEvent()
 
     yielded = [item async for item in plugin.on_group_message(event)]
@@ -559,7 +726,7 @@ async def test_single_pass_full_handler_yields_one_multimodal_main_request(
     assert len(yielded) == 1
     assert len(captured_requests) == 1
     assert captured_requests[0]["image_urls"] == [
-        "https://example.com/direct.png"
+        "data:image/png;base64,ZGlyZWN0"
     ]
     assert "Decide whether to join" in str(captured_requests[0]["prompt"])
 
@@ -589,7 +756,7 @@ async def test_passive_injection_uses_request_prompt_for_empty_plugin_event() ->
     assert "Now, a new message is coming:" in req.prompt
     assert "Alice 戳了你一下，请用一句话回复。" in req.prompt
     assert "[Empty]" not in req.prompt
-    assert req.contexts == []
+    assert req.contexts == ["old-context"]
 
 
 @pytest.mark.asyncio
@@ -603,7 +770,7 @@ async def test_passive_injection_prefers_request_prompt_for_poke_event() -> None
     assert "Now, a new message is coming:" in req.prompt
     assert "Alice 戳了你一下，请用一句话回复。" in req.prompt
     assert "[戳一戳: Alice/10001 -> 99999]" not in req.prompt
-    assert req.contexts == []
+    assert req.contexts == ["old-context"]
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse, urlunparse
 
-
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 BAD_VIDEO_CAPTION_PATTERNS = (

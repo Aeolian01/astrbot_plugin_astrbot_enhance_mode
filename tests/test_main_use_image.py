@@ -258,6 +258,70 @@ async def test_use_image_can_use_forward_context_registry(
 
 
 @pytest.mark.asyncio
+async def test_local_and_forward_image_registries_are_merged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin, event = _build_plugin(image_caption=False)
+    plugin.runtime.image_message_registry[event.unified_msg_origin]["123"] = {
+        "urls": ["https://example.com/direct.png"],
+        "cache_sources": ["fileid:direct"],
+        "captions": {0: "direct caption"},
+        "updated_at": 1,
+    }
+
+    async def get_cached_image_message(
+        _origin: str, _message_id: str
+    ) -> dict[str, object]:
+        return {
+            "urls": [
+                "https://example.com/direct.png",
+                "https://example.com/nested.png",
+            ],
+            "cache_sources": ["fileid:direct", "fileid:nested"],
+            "captions": {},
+            "updated_at": 2,
+        }
+
+    monkeypatch.setattr(
+        main_module,
+        "_get_forward_context_api",
+        lambda: _forward_context_api(
+            get_cached_image_message=get_cached_image_message,
+        ),
+    )
+
+    entry = await plugin._get_image_message_entry(event.unified_msg_origin, "123")
+
+    assert entry["urls"] == [
+        "https://example.com/direct.png",
+        "https://example.com/nested.png",
+    ]
+    assert entry["cache_sources"] == ["fileid:direct", "fileid:nested"]
+    assert entry["captions"] == {0: "direct caption"}
+
+
+def test_merge_image_registries_tolerates_invalid_updated_at() -> None:
+    plugin, _ = _build_plugin(image_caption=False)
+
+    entry = plugin._merge_image_message_entries(
+        {
+            "urls": ["https://example.com/direct.png"],
+            "updated_at": "not-a-timestamp",
+        },
+        {
+            "urls": ["https://example.com/nested.png"],
+            "updated_at": 2,
+        },
+    )
+
+    assert entry["urls"] == [
+        "https://example.com/direct.png",
+        "https://example.com/nested.png",
+    ]
+    assert entry["updated_at"] == 2
+
+
+@pytest.mark.asyncio
 async def test_use_image_default_mode_attaches_and_writes_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -133,6 +133,21 @@ class ActiveReplyConfig:
     model_choice_provider_id: str = ""
     model_choice_prompt: str = DEFAULT_MODEL_CHOICE_PROMPT
     whitelist: list[str] = field(default_factory=list)
+    # Pipeline v2 is opt-in so existing installations keep their current
+    # trigger cadence until the new gates have been verified in shadow/canary.
+    pipeline_v2_enable: bool = False
+    reply_max_age_sec: float = 15.0
+    cancel_on_newer_message: bool = True
+    preserved_context_rounds: int = 2
+    enhancement_prompt_max_chars: int = 3200
+    output_gate_enable: bool = True
+    active_reply_max_chars: int = 50
+    block_process_leak: bool = True
+    require_single_sendable_chain: bool = True
+    unsolicited_image_reply: bool = False
+    cooldown_sec: float = 300.0
+    bot_density_window: int = 20
+    bot_density_max: int = 3
 
 
 @dataclass(frozen=True)
@@ -178,6 +193,19 @@ class WebSearchConfig:
 
 
 @dataclass(frozen=True)
+class ChatHistoryToolConfig:
+    enable: bool = False
+    allowed_group_ids: list[str] = field(default_factory=list)
+    default_limit: int = 8
+    max_limit: int = 20
+    max_pages_per_turn: int = 2
+    max_messages_per_turn: int = 24
+    max_output_chars: int = 8192
+    cursor_ttl_sec: float = 60.0
+    api_timeout_sec: float = 3.0
+
+
+@dataclass(frozen=True)
 class MemoryRAGConfig:
     enable: bool = True
     embedding_provider_id: str = ""
@@ -205,6 +233,9 @@ class PluginConfig:
     )
     global_settings: GlobalSettingsConfig = field(default_factory=GlobalSettingsConfig)
     web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
+    chat_history_tool: ChatHistoryToolConfig = field(
+        default_factory=ChatHistoryToolConfig
+    )
     memory_rag: MemoryRAGConfig = field(default_factory=MemoryRAGConfig)
     memory_rag_webui: MemoryRAGWebUIConfig = field(default_factory=MemoryRAGWebUIConfig)
 
@@ -286,6 +317,36 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
             active_reply_raw.get("model_choice_prompt") or DEFAULT_MODEL_CHOICE_PROMPT
         ),
         whitelist=_parse_whitelist(active_reply_raw.get("whitelist", "")),
+        pipeline_v2_enable=_to_bool(active_reply_raw.get("pipeline_v2_enable"), False),
+        reply_max_age_sec=_to_pos_float(
+            active_reply_raw.get("reply_max_age_sec"), 15.0
+        ),
+        cancel_on_newer_message=_to_bool(
+            active_reply_raw.get("cancel_on_newer_message"), True
+        ),
+        preserved_context_rounds=max(
+            0, min(10, _to_int(active_reply_raw.get("preserved_context_rounds"), 2))
+        ),
+        enhancement_prompt_max_chars=max(
+            1000,
+            _to_int(active_reply_raw.get("enhancement_prompt_max_chars"), 3200),
+        ),
+        output_gate_enable=_to_bool(active_reply_raw.get("output_gate_enable"), True),
+        active_reply_max_chars=max(
+            1, _to_int(active_reply_raw.get("active_reply_max_chars"), 50)
+        ),
+        block_process_leak=_to_bool(active_reply_raw.get("block_process_leak"), True),
+        require_single_sendable_chain=_to_bool(
+            active_reply_raw.get("require_single_sendable_chain"), True
+        ),
+        unsolicited_image_reply=_to_bool(
+            active_reply_raw.get("unsolicited_image_reply"), False
+        ),
+        cooldown_sec=max(0.0, _to_float(active_reply_raw.get("cooldown_sec"), 300.0)),
+        bot_density_window=max(
+            1, _to_int(active_reply_raw.get("bot_density_window"), 20)
+        ),
+        bot_density_max=max(0, _to_int(active_reply_raw.get("bot_density_max"), 3)),
     )
 
     global_settings_raw = raw.get("global_settings", {})
@@ -329,6 +390,51 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         max_sources=max(0, _to_int(web_search_raw.get("max_sources"), 5)),
     )
 
+    chat_history_tool_raw = raw.get("chat_history_tool", {})
+    max_limit = max(
+        1,
+        min(50, _to_int(chat_history_tool_raw.get("max_limit"), 20)),
+    )
+    chat_history_tool = ChatHistoryToolConfig(
+        enable=_to_bool(chat_history_tool_raw.get("enable"), False),
+        allowed_group_ids=_parse_whitelist(
+            chat_history_tool_raw.get("allowed_group_ids", [])
+        ),
+        default_limit=max(
+            1,
+            min(
+                max_limit,
+                _to_int(chat_history_tool_raw.get("default_limit"), 8),
+            ),
+        ),
+        max_limit=max_limit,
+        max_pages_per_turn=max(
+            1,
+            min(
+                4,
+                _to_int(chat_history_tool_raw.get("max_pages_per_turn"), 2),
+            ),
+        ),
+        max_messages_per_turn=max(
+            1,
+            min(
+                100,
+                _to_int(chat_history_tool_raw.get("max_messages_per_turn"), 24),
+            ),
+        ),
+        max_output_chars=max(
+            1024,
+            min(
+                32768,
+                _to_int(chat_history_tool_raw.get("max_output_chars"), 8192),
+            ),
+        ),
+        cursor_ttl_sec=_to_pos_float(chat_history_tool_raw.get("cursor_ttl_sec"), 60.0),
+        api_timeout_sec=_to_pos_float(
+            chat_history_tool_raw.get("api_timeout_sec"), 3.0
+        ),
+    )
+
     memory_rag_raw = raw.get("memory_rag", {})
     memory_rag = MemoryRAGConfig(
         enable=_to_bool(memory_rag_raw.get("enable"), True),
@@ -357,6 +463,7 @@ def parse_plugin_config(raw: dict[str, Any] | None) -> PluginConfig:
         group_features=group_features,
         global_settings=global_settings,
         web_search=web_search,
+        chat_history_tool=chat_history_tool,
         memory_rag=memory_rag,
         memory_rag_webui=memory_rag_webui,
     )
